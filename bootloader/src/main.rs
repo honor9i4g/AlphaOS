@@ -5,6 +5,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use uefi::prelude::*;
+use uefi::proto::console::gop::GraphicsOutput;
 use uefi::proto::media::file::{File, FileAttribute, FileMode, FileType};
 
 const KERNEL_PATH: &uefi::CStr16 = uefi::cstr16!("\\EFI\\BOOT\\ALPHAKRN.EFI");
@@ -50,7 +51,7 @@ fn main() -> Status {
         }
     };
 
-    uefi::println!("AlphaOS bootloader: starting kernel...");
+    clear_firmware_screen();
     match uefi::boot::start_image(kernel_handle) {
         Ok(()) => {
             uefi::println!("AlphaOS kernel returned unexpectedly.");
@@ -60,6 +61,34 @@ fn main() -> Status {
             uefi::println!("AlphaOS bootloader: kernel start failed: {:?}", error);
             Status::ABORTED
         }
+    }
+}
+
+fn clear_firmware_screen() {
+    uefi::system::with_stdout(|stdout| {
+        if let Err(error) = stdout.clear() {
+            uefi::println!("Could not clear UEFI text console: {:?}", error);
+        }
+    });
+
+    let gop_handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(handle) => handle,
+        Err(error) => {
+            uefi::println!("Could not find GOP to clear firmware logo: {:?}", error);
+            return;
+        }
+    };
+    let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
+        Ok(gop) => gop,
+        Err(error) => {
+            uefi::println!("Could not open GOP to clear firmware logo: {:?}", error);
+            return;
+        }
+    };
+
+    let mut framebuffer = gop.frame_buffer();
+    unsafe {
+        core::ptr::write_bytes(framebuffer.as_mut_ptr(), 0, framebuffer.size());
     }
 }
 

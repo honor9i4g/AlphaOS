@@ -74,6 +74,12 @@ unless you sign both EFI images with keys trusted by the firmware.
 After the bootloader starts the kernel, type `help` and press Enter to see the
 available shell commands.
 
+The bootloader clears the UEFI text console and graphics framebuffer before
+starting the kernel, removing firmware boot messages and the TianoCore splash
+once AlphaOS takes over. The firmware splash may still appear briefly before
+the bootloader starts; changing that initial firmware behavior requires a
+firmware setting or a custom OVMF build.
+
 GitHub Actions builds both EFI images and uploads them together as the
 `alphaos-uefi` workflow artifact.
 
