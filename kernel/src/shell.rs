@@ -78,7 +78,14 @@ pub fn poll() {
 fn key(sc: u8) -> u8 {
     let s = unsafe { SHIFT };
     match sc {
-        0x29 => b' ',
+        0x29 => {
+            if s {
+                b'~'
+            } else {
+                b'`'
+            }
+        }
+        0x39 => b' ',
         0x02 => {
             if s {
                 b'!'
