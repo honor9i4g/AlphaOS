@@ -1,0 +1,11 @@
+[package]
+name = "alphaos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "AlphaOS-Kernel"
+path = "src/main.rs"
+
+[dependencies]
+uefi = { version = "0.36", features = ["panic_handler"] }

@@ -1,7 +1,3 @@
-[package]
-name = "AlphaOS"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-uefi = { version = "0.36", features = ["panic_handler"] }   
+[workspace]
+members = ["bootloader", "kernel"]
+resolver = "2"

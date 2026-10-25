@@ -25,4 +25,17 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build UEFI application
-        run: cargo build --release --target x86_64-unknown-uefi
+        run: cargo build --release --target x86_64-unknown-uefi --workspace
+
+      - name: Prepare EFI System Partition files
+        shell: bash
+        run: |
+          mkdir -p esp/EFI/BOOT
+          cp target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi esp/EFI/BOOT/BOOTX64.EFI
+          cp target/x86_64-unknown-uefi/release/AlphaOS-Kernel.efi esp/EFI/BOOT/ALPHAKRN.EFI
+
+      - name: Upload bootable EFI files
+        uses: actions/upload-artifact@v4
+        with:
+          name: alphaos-uefi
+          path: esp/EFI/BOOT/

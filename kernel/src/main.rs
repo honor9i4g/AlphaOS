@@ -45,38 +45,36 @@ extern "efiapi" {
 
 #[entry]
 fn main() -> Status {
-    if let Err(e) = uefi::helpers::init() {
-        uefi::println!("Init failed: {:?}", e);
+    if let Err(error) = uefi::helpers::init() {
+        uefi::println!("Kernel UEFI initialization failed: {:?}", error);
         return Status::ABORTED;
     }
 
-    let handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
-        Ok(h) => h,
-        Err(e) => {
-            uefi::println!("No GOP: {:?}", e);
+    let gop_handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(handle) => handle,
+        Err(error) => {
+            uefi::println!("Kernel could not find GOP: {:?}", error);
+            return Status::ABORTED;
+        }
+    };
+    let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
+        Ok(gop) => gop,
+        Err(error) => {
+            uefi::println!("Kernel could not open GOP: {:?}", error);
             return Status::ABORTED;
         }
     };
 
-    let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
-        Ok(g) => g,
-        Err(e) => {
-            uefi::println!("GOP open failed: {:?}", e);
-            return Status::ABORTED;
-        }
-    };
-
-    let (w, h) = gop.current_mode_info().resolution();
-    if w == 0 || h == 0 {
-        uefi::println!("Bad resolution");
+    let (width, height) = gop.current_mode_info().resolution();
+    if width == 0 || height == 0 {
+        uefi::println!("Kernel received an invalid graphics resolution.");
         return Status::ABORTED;
     }
-
-    let width = w as usize;
-    let height = h as usize;
-    let fb = gop.frame_buffer().as_mut_ptr();
-
-    video::init(fb, width, height);
+    video::init(
+        gop.frame_buffer().as_mut_ptr(),
+        width as usize,
+        height as usize,
+    );
 
     unsafe {
         video::draw_text(10, 10, "ALPHA OS v0.1", 0xFF, 0x00, 0x00);
@@ -85,14 +83,13 @@ fn main() -> Status {
 
     drop(gop);
     unsafe { core::arch::asm!("cli") };
-    let _mm = unsafe { uefi::boot::exit_boot_services(None) };
+    let _memory_map = unsafe { uefi::boot::exit_boot_services(None) };
 
     let stack_top = unsafe {
         core::ptr::addr_of_mut!(KERNEL_STACK.0)
             .cast::<u8>()
             .add(STACK_SIZE) as u64
     };
-
     unsafe { enter_kernel(stack_top, width as u64, height as u64) }
 }
 
@@ -103,7 +100,6 @@ fn kernel_main(_width: u64, _height: u64) -> ! {
     }
 
     shell::init();
-
     loop {
         shell::poll();
         core::hint::spin_loop();

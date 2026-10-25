@@ -1,90 +1,95 @@
 # AlphaOS
 
-AlphaOS is a small experimental operating-system project written in Rust. It
-boots as a 64-bit UEFI application, draws a simple shell using the UEFI
-Graphics Output Protocol framebuffer, and reads keyboard input directly.
+AlphaOS is an experimental x86-64 operating-system project written in Rust. It
+uses a two-stage boot flow: UEFI starts the AlphaOS bootloader, and the
+bootloader loads and starts a separate AlphaOS kernel image from the EFI System
+Partition (ESP).
 
 ## Features
 
-- UEFI x86-64 boot
-- Framebuffer text using a built-in 8x8 bitmap font
-- Basic keyboard input, including Shift and Backspace
+- Separate UEFI bootloader and kernel images
+- Framebuffer text using the UEFI Graphics Output Protocol and a built-in
+  8x8 bitmap font
+- Basic keyboard-driven shell with Shift and Backspace support
 - Shell commands: `help`, `clear`, `info`, and `time`
-- Programmable interval timer counter
+- GitHub Actions workflow that builds both images and packages the ESP files
 
 This is an early learning project, not a general-purpose operating system. It
 does not currently provide a filesystem, networking, or process management.
+The kernel is currently built as a UEFI-loadable EFI application; it is not yet
+a freestanding ELF kernel.
 
 ## Requirements
 
 - Rust toolchain with `rustup` and Cargo
 - The `x86_64-unknown-uefi` Rust target
-- A UEFI-capable virtual machine or computer
+- A UEFI-capable x86-64 virtual machine or computer
 - QEMU and OVMF firmware for virtual-machine testing
 
-Install the target once:
+Install the Rust target once:
 
-```powershell
+```sh
 rustup target add x86_64-unknown-uefi
 ```
 
 ## Build
 
-From the project directory:
+Build both images from the repository root:
 
-```powershell
-cargo build --release --target x86_64-unknown-uefi
+```sh
+cargo build --release --target x86_64-unknown-uefi --workspace
 ```
 
-The EFI application is created at:
+The build creates:
 
 ```text
-target/x86_64-unknown-uefi/release/AlphaOS.efi
+target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi
+target/x86_64-unknown-uefi/release/AlphaOS-Kernel.efi
 ```
 
-Cargo's `target` directory contains generated build files and does not need to
-be committed to GitHub. Build it again locally with the command above.
+## Prepare the ESP
 
-## Prepare a UEFI boot image
-
-Copy the built application to the standard removable-media UEFI boot path on
-the EFI System Partition (ESP). For example, to prepare the repository's `esp`
-folder in PowerShell:
+The firmware launches the bootloader at `EFI/BOOT/BOOTX64.EFI`. The
+bootloader expects the kernel at `EFI/BOOT/ALPHAKRN.EFI` on the same ESP.
+Prepare the repository's `esp` folder in PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force .\esp\EFI\BOOT | Out-Null
-Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS.efi `
+Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS-Bootloader.efi `
   .\esp\EFI\BOOT\BOOTX64.EFI -Force
+Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS-Kernel.efi `
+  .\esp\EFI\BOOT\ALPHAKRN.EFI -Force
 ```
 
-Use `esp` as the source for a FAT-formatted ESP image, or copy its contents to
-an existing ESP. The expected boot file path on the ESP is:
-
-```text
-EFI/BOOT/BOOTX64.EFI
-```
+Use the `esp` folder to create a FAT-formatted ESP image, or copy its contents
+to an existing ESP. Both EFI files must be present at the paths above.
 
 ## Run in QEMU
 
-Use an x86-64 QEMU machine configured with UEFI/OVMF firmware, and attach the
-FAT-formatted ESP containing `EFI/BOOT/BOOTX64.EFI` as a bootable drive. The
-exact firmware and disk-image paths depend on your QEMU installation. Secure
-Boot must be disabled unless you sign the EFI application with a key trusted
-by the firmware.
+Run an x86-64 QEMU machine with UEFI/OVMF firmware and attach a FAT-formatted
+ESP containing both files as a bootable drive. The exact firmware and disk
+image paths depend on your QEMU installation. Secure Boot must be disabled
+unless you sign both EFI images with keys trusted by the firmware.
 
-After boot, type `help` and press Enter to see the available shell commands.
+After the bootloader starts the kernel, type `help` and press Enter to see the
+available shell commands.
+
+GitHub Actions builds both EFI images and uploads them together as the
+`alphaos-uefi` workflow artifact.
 
 ## Project layout
 
 ```text
-src/
-  font.rs     Bitmap font and character rendering
-  main.rs     UEFI entry point, framebuffer setup, and kernel handoff
-  port.rs     x86 I/O-port access
-  shell.rs    Keyboard input and command shell
-  timer.rs    Programmable interval timer setup and counter
-  video.rs    Framebuffer drawing helpers
-esp/          Optional folder used to prepare a UEFI boot image
+bootloader/
+  src/main.rs   Loads ALPHAKRN.EFI from the ESP and starts it through UEFI
+kernel/
+  src/main.rs   Kernel UEFI entry point, graphics setup, and shell handoff
+  src/font.rs   Built-in bitmap font
+  src/port.rs   x86 I/O-port access
+  src/shell.rs  Keyboard input and command shell
+  src/timer.rs  Programmable interval timer counter
+  src/video.rs  Framebuffer drawing helpers
+esp/            Staging folder for the two EFI boot files
 ```
 
 ## License
