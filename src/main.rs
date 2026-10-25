@@ -17,6 +17,15 @@ struct KernelStack([u8; STACK_SIZE]);
 
 static mut KERNEL_STACK: KernelStack = KernelStack([0; STACK_SIZE]);
 
+#[no_mangle]
+pub unsafe extern "C" fn wcslen(string: *const u16) -> usize {
+    let mut length = 0;
+    while unsafe { *string.add(length) } != 0 {
+        length += 1;
+    }
+    length
+}
+
 core::arch::global_asm!(
     ".global enter_kernel",
     "enter_kernel:",
