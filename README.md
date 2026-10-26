@@ -1,9 +1,9 @@
 # AlphaOS
 
-AlphaOS is an experimental x86-64 operating-system project written in Rust. It
-uses a two-stage boot flow: UEFI starts the AlphaOS bootloader, and the
-bootloader loads and starts a separate AlphaOS kernel image from the EFI System
-Partition (ESP).
+AlphaOS is an experimental x86-64 operating-system project written in Rust.
+The repository currently keeps its original UEFI kernel and a separate
+freestanding x86-64 kernel prototype so the new boot path can be developed
+without losing the existing QEMU-testable shell.
 
 ## Features
 
@@ -14,17 +14,23 @@ Partition (ESP).
 - Built-in shell commands: `help`, `clear`, `info`, `version`, `uname`,
   `whoami`, `echo`, `uptime`, `time`, `ticks`, `calc`, `shutdown`, `restart`,
   and `commands`
-- GitHub Actions workflow that builds both images and packages the ESP files
+- GitHub Actions workflow that builds the UEFI image pair and the freestanding
+  kernel prototype, then packages the UEFI ESP files
+- A freestanding `x86_64-unknown-none` kernel prototype that receives a
+  framebuffer through the Limine boot protocol
 
 This is an early learning project, not a general-purpose operating system. It
 does not currently provide a filesystem, networking, or process management.
-The kernel is currently built as a UEFI-loadable EFI application; it is not yet
-a freestanding ELF kernel.
+The existing shell kernel is still built as a UEFI-loadable EFI application.
+The new freestanding kernel is an early boot-screen prototype; it does not yet
+replace the UEFI shell or provide interrupts, input, memory management, or
+application support.
 
 ## Requirements
 
 - Rust toolchain with `rustup` and Cargo
 - The `x86_64-unknown-uefi` Rust target
+- The `x86_64-unknown-none` Rust target (for the freestanding prototype)
 - A UEFI-capable x86-64 virtual machine or computer
 - QEMU and OVMF firmware for virtual-machine testing
 
@@ -32,6 +38,7 @@ Install the Rust target once:
 
 ```sh
 rustup target add x86_64-unknown-uefi
+rustup target add x86_64-unknown-none
 ```
 
 ## Build
@@ -48,6 +55,18 @@ The build creates:
 target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi
 target/x86_64-unknown-uefi/release/AlphaOS-Kernel.efi
 ```
+
+Build the freestanding kernel prototype separately:
+
+```powershell
+Set-Location .\kernel-freestanding
+cargo build --release
+```
+
+This produces
+`kernel-freestanding/target/x86_64-unknown-none/release/alphaos-kernel-freestanding`,
+a freestanding ELF kernel. It is not yet included in the existing UEFI ESP
+image; bootable Limine media setup is a follow-up step.
 
 ## Prepare the ESP
 
@@ -73,8 +92,10 @@ ESP containing both files as a bootable drive. The exact firmware and disk
 image paths depend on your QEMU installation. Secure Boot must be disabled
 unless you sign both EFI images with keys trusted by the firmware.
 
-After the bootloader starts the kernel, type `help` and press Enter to see the
-available shell commands.
+The current QEMU instructions boot the existing UEFI shell. After the
+bootloader starts that kernel, type `help` and press Enter to see its commands.
+The freestanding prototype can be built independently, but does not yet have a
+packaged Limine image to run in QEMU.
 
 Use `calc 12 * 3`, `echo hello`, `uptime`, or `help calc` to try the shell.
 The `shutdown` and `restart` commands use UEFI runtime services to power off or
@@ -90,8 +111,8 @@ once AlphaOS takes over. The firmware splash may still appear briefly before
 the bootloader starts; changing that initial firmware behavior requires a
 firmware setting or a custom OVMF build.
 
-GitHub Actions builds both EFI images and uploads them together as the
-`alphaos-uefi` workflow artifact.
+GitHub Actions builds both EFI images and the freestanding kernel prototype.
+It uploads the two EFI images together as the `alphaos-uefi` workflow artifact.
 
 ## Project layout
 
@@ -99,7 +120,7 @@ GitHub Actions builds both EFI images and uploads them together as the
 bootloader/
   src/main.rs   Loads ALPHAKRN.EFI from the ESP and starts it through UEFI
 kernel/
-  src/main.rs   Kernel UEFI entry point, graphics setup, and shell handoff
+  src/main.rs   Existing UEFI kernel entry point, graphics setup, and shell handoff
   src/font.rs   Built-in bitmap font
   src/commands.rs   Shell command dispatcher
   src/commands/      Command groups, including math and timer commands
@@ -108,6 +129,11 @@ kernel/
   src/timer.rs  Programmable interval timer counter
   src/video.rs  Framebuffer drawing helpers
 esp/            Staging folder for the two EFI boot files
+kernel-freestanding/
+  src/main.rs   Freestanding Limine entry point and initial framebuffer screen
+  linker-x86_64.ld
+                 x86-64 kernel ELF linker layout
+  limine.conf   Limine boot entry for the next packaging step
 ```
 ## Versions
 - 0.1.0

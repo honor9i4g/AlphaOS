@@ -1,0 +1,15 @@
+[package]
+name = "alphaos-kernel-freestanding"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+limine = "=0.5.0"
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
