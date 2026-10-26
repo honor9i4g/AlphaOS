@@ -109,6 +109,11 @@ kernel/
   src/video.rs  Framebuffer drawing helpers
 esp/            Staging folder for the two EFI boot files
 ```
+## Versions
+- 0.1.0
+ Having one EFI With Kernel Inside Of It no Seperate Files
+- 0.2.0 
+Having Cleaner And Seperate
 
 ## License
 
