@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 
+mod commands;
 mod font;
 mod port;
 mod shell;

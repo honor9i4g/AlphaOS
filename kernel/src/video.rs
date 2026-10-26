@@ -30,10 +30,14 @@ pub unsafe fn draw_char(x: u32, y: u32, ch: u8) {
 }
 
 pub unsafe fn draw_text(x: u32, y: u32, text: &str, r: u8, g: u8, b: u8) {
+    draw_bytes(x, y, text.as_bytes(), r, g, b);
+}
+
+pub unsafe fn draw_bytes(x: u32, y: u32, text: &[u8], r: u8, g: u8, b: u8) {
     let mut cx = x;
-    for ch in text.bytes() {
+    for &ch in text {
         crate::font::draw_char(FB, WIDTH, HEIGHT, cx, y, ch, r, g, b);
-        cx += 8;
+        cx = cx.saturating_add(8);
     }
 }
 

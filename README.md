@@ -11,7 +11,9 @@ Partition (ESP).
 - Framebuffer text using the UEFI Graphics Output Protocol and a built-in
   8x8 bitmap font
 - Basic keyboard-driven shell with Shift and Backspace support
-- Shell commands: `help`, `clear`, `info`, and `time`
+- Built-in shell commands: `help`, `clear`, `info`, `version`, `uname`,
+  `whoami`, `echo`, `uptime`, `time`, `ticks`, `calc`, `shutdown`, `restart`,
+  and `commands`
 - GitHub Actions workflow that builds both images and packages the ESP files
 
 This is an early learning project, not a general-purpose operating system. It
@@ -74,6 +76,14 @@ unless you sign both EFI images with keys trusted by the firmware.
 After the bootloader starts the kernel, type `help` and press Enter to see the
 available shell commands.
 
+Use `calc 12 * 3`, `echo hello`, `uptime`, or `help calc` to try the shell.
+The `shutdown` and `restart` commands use UEFI runtime services to power off or
+reboot the machine.
+The command dispatcher is designed to grow as kernel features are added.
+Application and driver loading are not implemented yet: AlphaOS still needs a
+kernel filesystem and executable-loading/runtime support before it can run
+separate OS applications.
+
 The bootloader clears the UEFI text console and graphics framebuffer before
 starting the kernel, removing firmware boot messages and the TianoCore splash
 once AlphaOS takes over. The firmware splash may still appear briefly before
@@ -91,6 +101,8 @@ bootloader/
 kernel/
   src/main.rs   Kernel UEFI entry point, graphics setup, and shell handoff
   src/font.rs   Built-in bitmap font
+  src/commands.rs   Shell command dispatcher
+  src/commands/      Command groups, including math and timer commands
   src/port.rs   x86 I/O-port access
   src/shell.rs  Keyboard input and command shell
   src/timer.rs  Programmable interval timer counter

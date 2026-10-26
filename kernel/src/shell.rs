@@ -44,11 +44,18 @@ pub fn poll() {
                 0x1C => {
                     BUF[POS] = 0;
                     let cmd = core::str::from_utf8(&BUF[..POS]).unwrap_or("");
-                    let cleared = run(cmd);
+                    let output_y = CY.saturating_add(LINE_HEIGHT);
+                    let result = crate::commands::execute(cmd, output_y);
                     POS = 0;
                     BUF = [0; 128];
-                    if !cleared {
-                        CY = CY.saturating_add(LINE_HEIGHT * 2);
+                    if result.clear_screen {
+                        crate::video::clear();
+                        crate::video::draw_text(10, 10, "ALPHA OS v0.1", 0xFF, 0x00, 0x00);
+                        CY = 120;
+                        draw_prompt();
+                    } else {
+                        CY = output_y
+                            .saturating_add(result.output_lines.saturating_mul(LINE_HEIGHT));
                         if CY > 380 {
                             crate::video::clear();
                             crate::video::draw_text(10, 10, "ALPHA OS v0.1", 0xFF, 0x00, 0x00);
@@ -154,6 +161,13 @@ fn key(sc: u8) -> u8 {
                 b')'
             } else {
                 b'0'
+            }
+        }
+        0x0C => {
+            if s {
+                b'_'
+            } else {
+                b'-'
             }
         }
         0x10 => {
@@ -415,51 +429,4 @@ unsafe fn redraw() {
 unsafe fn draw_prompt() {
     crate::video::draw_text(PROMPT_X, CY, "c: ", 0xFF, 0xFF, 0xFF);
     CX = INPUT_X;
-}
-
-fn run(cmd: &str) -> bool {
-    let cmd = cmd.trim();
-    let y = unsafe { CY.saturating_add(LINE_HEIGHT) };
-    unsafe {
-        match cmd {
-            "help" => crate::video::draw_text(10, y, "help  clear  info  time", 0xFF, 0xFF, 0xFF),
-            "clear" => {
-                crate::video::clear();
-                crate::video::draw_text(10, 10, "ALPHA OS v0.1", 0xFF, 0x00, 0x00);
-                CY = 120;
-                draw_prompt();
-                return true;
-            }
-            "info" => {
-                crate::video::draw_text(10, y, "ALPHA OS v0.1 | Rust + UEFI", 0x00, 0xFF, 0x00)
-            }
-            "time" => {
-                let t = crate::timer::tick_count();
-                let mut s = [0u8; 21];
-                let mut v = t;
-                let mut p = 20;
-                if v == 0 {
-                    s[p] = b'0';
-                    p -= 1;
-                }
-                while v > 0 {
-                    s[p] = b'0' + (v % 10) as u8;
-                    v /= 10;
-                    p -= 1;
-                }
-                let start = if s[0] == 0 { 1 } else { 0 };
-                crate::video::draw_text(
-                    10,
-                    y,
-                    core::str::from_utf8(&s[start..20]).unwrap_or(""),
-                    0xFF,
-                    0xFF,
-                    0x00,
-                );
-            }
-            "" => {}
-            _ => crate::video::draw_text(10, y, "Unknown. Type help", 0xFF, 0x00, 0x00),
-        }
-    }
-    false
 }
