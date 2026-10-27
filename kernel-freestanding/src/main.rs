@@ -4,7 +4,9 @@
 #[path = "../../kernel/src/font.rs"]
 #[allow(dead_code, unsafe_op_in_unsafe_fn)]
 mod font;
+mod keyboard;
 
+use alphaos_syscall_abi as syscall;
 use core::arch::asm;
 use limine::BaseRevision;
 use limine::framebuffer::MemoryModel;
@@ -18,6 +20,18 @@ struct PixelFormat {
     green_shift: u8,
     blue_size: u8,
     blue_shift: u8,
+}
+
+struct Console {
+    address: *mut u8,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    pixel_format: PixelFormat,
+    cursor_y: usize,
+    input: [u8; 128],
+    input_len: usize,
+    keyboard: keyboard::Keyboard,
 }
 
 #[used]
@@ -77,47 +91,17 @@ extern "C" fn kmain() -> ! {
     let address = framebuffer.addr();
 
     clear_screen(address, width, height, pitch, pixel_format);
-    draw_text(
-        address,
-        width,
-        height,
-        pitch,
-        pixel_format,
-        24,
-        24,
-        "ALPHAOS FREESTANDING KERNEL",
-        0x45,
-        0xD4,
-        0x8B,
-    );
-    draw_text(
-        address,
-        width,
-        height,
-        pitch,
-        pixel_format,
-        24,
-        48,
-        "BOOTED THROUGH LIMINE",
-        0xFF,
-        0xFF,
-        0xFF,
-    );
-    draw_text(
-        address,
-        width,
-        height,
-        pitch,
-        pixel_format,
-        24,
-        80,
-        "NEXT: MEMORY, INTERRUPTS, AND INPUT",
-        0xB0,
-        0xB0,
-        0xB0,
-    );
+    if syscall::SYSCALLS.len() != syscall::SYSCALL_COUNT
+        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0000
+    {
+        halt();
+    }
 
-    halt()
+    let mut console = Console::new(address, width, height, pitch, pixel_format);
+    loop {
+        console.poll();
+        core::hint::spin_loop();
+    }
 }
 
 fn valid_mask(size: u8, shift: u8) -> bool {
@@ -219,6 +203,182 @@ fn write_pixel(
 fn channel(value: u8, size: u8, shift: u8) -> u32 {
     let max = (1_u32 << size) - 1;
     ((u32::from(value) * max + 127) / 255) << shift
+}
+
+impl Console {
+    const LEFT: usize = 24;
+    const INPUT_X: usize = Self::LEFT + 7 * 8;
+    const TOP: usize = 24;
+    const PROMPT_Y: usize = 80;
+    const LINE_HEIGHT: usize = 16;
+    const BACKGROUND: (u8, u8, u8) = (0x10, 0x14, 0x1C);
+    const TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
+    fn new(
+        address: *mut u8,
+        width: usize,
+        height: usize,
+        pitch: usize,
+        pixel_format: PixelFormat,
+    ) -> Self {
+        let console = Self {
+            address,
+            width,
+            height,
+            pitch,
+            pixel_format,
+            cursor_y: Self::PROMPT_Y,
+            input: [0; 128],
+            input_len: 0,
+            keyboard: {
+                let mut keyboard = keyboard::Keyboard::new();
+                keyboard.flush_pending();
+                keyboard
+            },
+        };
+        console.draw_header();
+        console.draw_prompt();
+        console
+    }
+
+    fn poll(&mut self) {
+        match self.keyboard.poll() {
+            Some(keyboard::KeyEvent::Character(character)) => self.type_character(character),
+            Some(keyboard::KeyEvent::Backspace) => self.backspace(),
+            Some(keyboard::KeyEvent::Enter) => self.submit_line(),
+            None => {}
+        }
+    }
+
+    fn type_character(&mut self, character: u8) {
+        let max_chars = self.width.saturating_sub(Self::INPUT_X) / 8;
+        if self.input_len >= self.input.len() - 1 || self.input_len >= max_chars {
+            return;
+        }
+
+        self.input[self.input_len] = character;
+        self.input_len += 1;
+        draw_text(
+            self.address,
+            self.width,
+            self.height,
+            self.pitch,
+            self.pixel_format,
+            Self::INPUT_X + (self.input_len - 1) * 8,
+            self.cursor_y,
+            core::str::from_utf8(&self.input[self.input_len - 1..self.input_len]).unwrap_or(" "),
+            Self::TEXT.0,
+            Self::TEXT.1,
+            Self::TEXT.2,
+        );
+    }
+
+    fn backspace(&mut self) {
+        if self.input_len == 0 {
+            return;
+        }
+
+        self.input_len -= 1;
+        self.input[self.input_len] = 0;
+        self.fill_rect(
+            Self::INPUT_X + self.input_len * 8,
+            self.cursor_y,
+            8,
+            8,
+            Self::BACKGROUND,
+        );
+    }
+
+    fn submit_line(&mut self) {
+        self.input_len = 0;
+        self.input.fill(0);
+        self.cursor_y = self.cursor_y.saturating_add(Self::LINE_HEIGHT);
+        if self.cursor_y + 8 >= self.height {
+            clear_screen(
+                self.address,
+                self.width,
+                self.height,
+                self.pitch,
+                self.pixel_format,
+            );
+            self.cursor_y = Self::PROMPT_Y;
+            self.draw_header();
+        }
+        self.draw_prompt();
+    }
+
+    fn draw_header(&self) {
+        self.draw_string(
+            Self::LEFT,
+            Self::TOP,
+            "ALPHAOS FREESTANDING KERNEL",
+            0x45,
+            0xD4,
+            0x8B,
+        );
+        self.draw_string(
+            Self::LEFT,
+            Self::TOP + 24,
+            "Type keys, Backspace edits, Enter submits.",
+            0xB0,
+            0xB0,
+            0xB0,
+        );
+        self.draw_string(
+            Self::LEFT,
+            Self::TOP + 48,
+            "Syscall ABI 1.0: 20 reserved calls",
+            0xB0,
+            0xB0,
+            0xB0,
+        );
+    }
+
+    fn draw_prompt(&self) {
+        self.draw_string(
+            Self::LEFT,
+            self.cursor_y,
+            "alpha> ",
+            Self::TEXT.0,
+            Self::TEXT.1,
+            Self::TEXT.2,
+        );
+    }
+
+    fn draw_string(&self, x: usize, y: usize, text: &str, red: u8, green: u8, blue: u8) {
+        draw_text(
+            self.address,
+            self.width,
+            self.height,
+            self.pitch,
+            self.pixel_format,
+            x,
+            y,
+            text,
+            red,
+            green,
+            blue,
+        );
+    }
+
+    fn fill_rect(&self, x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
+        for row in y..y.saturating_add(height).min(self.height) {
+            for column in x..x.saturating_add(width).min(self.width) {
+                write_pixel(
+                    self.address,
+                    self.width,
+                    self.height,
+                    self.pitch,
+                    self.pixel_format,
+                    column,
+                    row,
+                    color.0,
+                    color.1,
+                    color.2,
+                );
+            }
+        }
+    }
 }
 
 fn halt() -> ! {

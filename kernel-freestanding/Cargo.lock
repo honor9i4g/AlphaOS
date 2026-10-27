@@ -6,8 +6,13 @@ version = 4
 name = "alphaos-kernel-freestanding"
 version = "0.2.0"
 dependencies = [
+ "alphaos-syscall-abi",
  "limine",
 ]
+
+[[package]]
+name = "alphaos-syscall-abi"
+version = "0.1.0"
 
 [[package]]
 name = "bitflags"

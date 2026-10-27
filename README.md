@@ -22,9 +22,30 @@ without losing the existing QEMU-testable shell.
 This is an early learning project, not a general-purpose operating system. It
 does not currently provide a filesystem, networking, or process management.
 The existing shell kernel is still built as a UEFI-loadable EFI application.
-The new freestanding kernel is an early boot-screen prototype; it does not yet
-replace the UEFI shell or provide interrupts, input, memory management, or
-application support.
+The new freestanding kernel is an early prototype with polled PS/2 keyboard
+input and a basic text prompt. It does not yet replace the UEFI shell or
+provide interrupts, memory management, commands, or application support.
+Keyboard input currently supports printable US-layout keys, Shift, Backspace,
+and Enter; Enter keeps the typed line on screen and opens a new prompt. Lines
+are not executed as commands.
+
+## Freestanding syscall ABI
+
+The freestanding kernel defines 20 numbered syscall slots in
+`kernel-freestanding/syscall-abi` as the planned kernel/application
+interface. The ABI is currently a kernel-side dispatcher only: `get_abi_version`
+works, while the other calls return `ENOSYS` until their kernel services exist.
+There is not yet a user-mode transition or syscall CPU entry point, so `.apn`
+applications cannot call these entries yet. Safe user-memory access, process
+management, filesystem support, and the `.apn` loader must be added before
+application syscalls can be enabled.
+
+Test the syscall ABI from the `kernel-freestanding` directory:
+
+```powershell
+Set-Location .\kernel-freestanding\syscall-abi
+cargo test --target x86_64-pc-windows-msvc
+```
 
 ## Requirements
 
@@ -94,8 +115,15 @@ unless you sign both EFI images with keys trusted by the firmware.
 
 The current QEMU instructions boot the existing UEFI shell. After the
 bootloader starts that kernel, type `help` and press Enter to see its commands.
-The freestanding prototype can be built independently, but does not yet have a
-packaged Limine image to run in QEMU.
+To test the freestanding kernel, build it and create a FAT ESP containing the
+Limine UEFI executable at `EFI/BOOT/BOOTX64.EFI`, the repository's
+`kernel-freestanding/limine.conf`, and the kernel ELF at
+`boot/alphaos-kernel`. Boot that ESP using UEFI firmware. If the UEFI shell
+opens instead of Limine, run `map -r`, switch to the filesystem containing the
+ESP (usually `fs0:`), then run `\EFI\BOOT\BOOTX64.EFI`. Click the QEMU window
+and try typing `hello`, Backspace, and Enter at the `alpha>` prompt. The
+freestanding kernel currently polls the emulated PS/2 keyboard; it does not yet
+support USB keyboard drivers.
 
 Use `calc 12 * 3`, `echo hello`, `uptime`, or `help calc` to try the shell.
 The `shutdown` and `restart` commands use UEFI runtime services to power off or
@@ -131,8 +159,11 @@ kernel/
 esp/            Staging folder for the two EFI boot files
 kernel-freestanding/
   src/main.rs   Freestanding Limine entry point and initial framebuffer screen
+  src/keyboard.rs
+                 Polled PS/2 keyboard input and US-layout scan-code mapping
   linker-x86_64.ld
                  x86-64 kernel ELF linker layout
+  syscall-abi/  Shared reserved syscall IDs for the kernel and future apps
   limine.conf   Limine boot entry for the next packaging step
 ```
 ## Versions

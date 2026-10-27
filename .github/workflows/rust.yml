@@ -31,6 +31,10 @@ jobs:
         working-directory: kernel-freestanding
         run: cargo fmt --all -- --check
 
+      - name: Test syscall ABI
+        working-directory: kernel-freestanding/syscall-abi
+        run: cargo test --target x86_64-unknown-linux-gnu
+
       - name: Build freestanding x86-64 kernel
         working-directory: kernel-freestanding
         run: cargo build --release
