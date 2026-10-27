@@ -32,18 +32,7 @@ jobs:
       - name: Test syscall ABI
         working-directory: kernel-freestanding/syscall-abi
         run: cargo test --target x86_64-unknown-linux-gnu
-
-      - name: Build freestanding x86-64 kernel
-        working-directory: kernel-freestanding
-        run: cargo build --release
-
-      - name: Prepare EFI System Partition files
-        shell: bash
-        run: |
-          mkdir -p esp/EFI/BOOT
-          cp target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi esp/EFI/BOOT/BOOTX64.EFI
-          cp target/x86_64-unknown-uefi/release/AlphaOS-Kernel.efi esp/EFI/BOOT/ALPHAKRN.EFI
-
+        
       - name: Upload bootable EFI files
         uses: actions/upload-artifact@v4
         with:
