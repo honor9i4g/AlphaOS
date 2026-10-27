@@ -92,7 +92,7 @@ extern "C" fn kmain() -> ! {
 
     clear_screen(address, width, height, pitch, pixel_format);
     if syscall::SYSCALLS.len() != syscall::SYSCALL_COUNT
-        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0000
+        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0001
     {
         halt();
     }

@@ -8,8 +8,8 @@
 //! non-zero error is a positive errno value. The CPU entry is not implemented.
 
 pub const SYSCALL_ABI_MAJOR: u16 = 1;
-pub const SYSCALL_ABI_MINOR: u16 = 0;
-pub const SYSCALL_COUNT: usize = 20;
+pub const SYSCALL_ABI_MINOR: u16 = 1;
+pub const SYSCALL_COUNT: usize = 31;
 
 pub const ENOSYS: u64 = 38;
 
@@ -21,6 +21,8 @@ pub enum SyscallCategory {
     Memory,
     Time,
     SystemInfo,
+    Device,
+    Communication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +48,17 @@ pub enum SyscallId {
     Spawn = 17,
     Wait = 18,
     GetAbiVersion = 19,
+    DeviceList = 20,
+    DeviceOpen = 21,
+    DeviceControl = 22,
+    DeviceRead = 23,
+    DeviceWrite = 24,
+    GetSystemInfo = 25,
+    ChannelPairCreate = 26,
+    ChannelSend = 27,
+    ChannelReceive = 28,
+    ChannelClose = 29,
+    SharedMemoryCreate = 30,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +211,90 @@ pub const SYSCALLS: [SyscallInfo; SYSCALL_COUNT] = [
         argument_count: 0,
         arguments: ["", "", "", "", "", ""],
     },
+    SyscallInfo {
+        id: SyscallId::DeviceList,
+        name: "device_list",
+        category: SyscallCategory::Device,
+        argument_count: 2,
+        arguments: ["entries_ptr", "capacity", "", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::DeviceOpen,
+        name: "device_open",
+        category: SyscallCategory::Device,
+        argument_count: 2,
+        arguments: ["device_id", "access_flags", "", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::DeviceControl,
+        name: "device_control",
+        category: SyscallCategory::Device,
+        argument_count: 6,
+        arguments: [
+            "device_handle",
+            "request",
+            "input_ptr",
+            "input_len",
+            "output_ptr",
+            "output_len",
+        ],
+    },
+    SyscallInfo {
+        id: SyscallId::DeviceRead,
+        name: "device_read",
+        category: SyscallCategory::Device,
+        argument_count: 3,
+        arguments: ["device_handle", "buffer_ptr", "length", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::DeviceWrite,
+        name: "device_write",
+        category: SyscallCategory::Device,
+        argument_count: 3,
+        arguments: ["device_handle", "buffer_ptr", "length", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::GetSystemInfo,
+        name: "get_system_info",
+        category: SyscallCategory::SystemInfo,
+        argument_count: 3,
+        arguments: ["info_kind", "buffer_ptr", "buffer_len", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::ChannelPairCreate,
+        name: "channel_pair_create",
+        category: SyscallCategory::Communication,
+        argument_count: 2,
+        arguments: ["handles_ptr", "flags", "", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::ChannelSend,
+        name: "channel_send",
+        category: SyscallCategory::Communication,
+        argument_count: 4,
+        arguments: ["channel_handle", "message_ptr", "length", "flags", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::ChannelReceive,
+        name: "channel_receive",
+        category: SyscallCategory::Communication,
+        argument_count: 4,
+        arguments: ["channel_handle", "buffer_ptr", "capacity", "flags", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::ChannelClose,
+        name: "channel_close",
+        category: SyscallCategory::Communication,
+        argument_count: 1,
+        arguments: ["channel_handle", "", "", "", "", ""],
+    },
+    SyscallInfo {
+        id: SyscallId::SharedMemoryCreate,
+        name: "shared_memory_create",
+        category: SyscallCategory::Communication,
+        argument_count: 2,
+        arguments: ["size", "flags", "", "", "", ""],
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,8 +338,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn syscall_table_has_twenty_stable_sequential_ids() {
-        assert_eq!(SYSCALLS.len(), 20);
+    fn syscall_table_has_stable_sequential_ids_and_complete_metadata() {
+        assert_eq!(SYSCALLS.len(), 31);
         for (number, info) in SYSCALLS.iter().enumerate() {
             assert_eq!(info.id as usize, number);
             assert!(!info.name.is_empty());
@@ -252,6 +349,18 @@ mod tests {
                 .all(|argument| argument.is_empty()));
             assert_eq!(syscall_info(number as u64), Some(info));
         }
+    }
+
+    #[test]
+    fn original_syscall_numbers_remain_stable_and_all_categories_are_present() {
+        assert_eq!(SyscallId::Exit as u64, 0);
+        assert_eq!(SyscallId::GetAbiVersion as u64, 19);
+        assert!(SYSCALLS
+            .iter()
+            .any(|info| info.category == SyscallCategory::Device));
+        assert!(SYSCALLS
+            .iter()
+            .any(|info| info.category == SyscallCategory::Communication));
     }
 
     #[test]
@@ -270,13 +379,16 @@ mod tests {
     fn get_abi_version_returns_major_minor_pair() {
         let result = dispatch(SyscallId::GetAbiVersion as u64, [0; 6]);
 
-        assert_eq!(result.value, 0x0001_0000);
+        assert_eq!(result.value, 0x0001_0001);
         assert_eq!(result.error, 0);
     }
 
     #[test]
     fn unavailable_calls_return_not_implemented() {
-        for info in &SYSCALLS[..SYSCALL_COUNT - 1] {
+        for info in SYSCALLS
+            .iter()
+            .filter(|info| info.id != SyscallId::GetAbiVersion)
+        {
             let result = dispatch(info.id as u64, [0; 6]);
 
             assert_eq!(result.value, u64::MAX, "{}", info.name);

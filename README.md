@@ -31,17 +31,22 @@ are not executed as commands.
 
 ## Freestanding syscall ABI
 
-The freestanding kernel defines 20 numbered syscall slots in
+The freestanding kernel defines 31 numbered syscall slots in
 `kernel-freestanding/syscall-abi` as the planned kernel/application
-interface. Each ID has category and argument metadata; assigned IDs are kept
-stable as the ABI grows. The initial set covers process, file, memory, time,
-and system-information calls. `get_abi_version` works through the kernel-side
-dispatcher; the other 19 slots return `ENOSYS` until their services exist.
-The ABI defines an x86-64 register convention, but there is not yet a
-user-mode transition or CPU syscall entry point, so `.apn` applications cannot
-invoke it yet. Safe user-memory access, process management, filesystem
-support, and the `.apn` loader must be added before app syscalls can be enabled.
-Device-control and IPC calls can be added later without renumbering these IDs.
+interface (ABI version 1.1). Each ID has category and argument metadata;
+assigned IDs are kept stable as the ABI grows. The custom AlphaOS set covers
+process, file, memory, time, system-information, device, and communication
+calls. Device access uses device IDs and handles; IPC uses message channels and
+shared-memory handles rather than copying Linux's `ioctl`, `pipe`, or `socket`
+interface. Existing memory mapping can map a shared-memory handle.
+
+Only `get_abi_version` works through the kernel-side dispatcher; the other 30
+slots return `ENOSYS` until their services exist. These definitions are the
+planned ABI, not a fully operational syscall implementation. The ABI defines
+an x86-64 register convention, but there is not yet a user-mode transition or
+CPU syscall entry point, so `.apn` applications cannot invoke it yet. Safe
+user-memory access, process management, filesystem/device services, and the
+`.apn` loader must be added before app syscalls can be enabled.
 
 The `alpha>` prompt is only for verifying keyboard input; Enter does not run
 commands.
