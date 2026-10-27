@@ -1,16 +1,27 @@
 #![no_std]
 
-//! Shared syscall numbers and result layout for the kernel and future apps.
+//! Shared syscall numbers and register/result layout for the kernel and apps.
 //!
 //! The planned x86-64 entry places the syscall number in `RAX` and six
-//! arguments in `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9`. The result uses
-//! `RAX` for `value` and `RDX` for `error`. The CPU entry is not implemented.
+//! arguments in `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9`. A return value uses
+//! `RAX` for `value` and `RDX` for `error`; zero error means success, and a
+//! non-zero error is a positive errno value. The CPU entry is not implemented.
 
 pub const SYSCALL_ABI_MAJOR: u16 = 1;
 pub const SYSCALL_ABI_MINOR: u16 = 0;
 pub const SYSCALL_COUNT: usize = 20;
 
 pub const ENOSYS: u64 = 38;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SyscallCategory {
+    Process,
+    File,
+    Memory,
+    Time,
+    SystemInfo,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -41,88 +52,151 @@ pub enum SyscallId {
 pub struct SyscallInfo {
     pub id: SyscallId,
     pub name: &'static str,
+    pub category: SyscallCategory,
+    pub argument_count: u8,
+    pub arguments: [&'static str; 6],
 }
 
 pub const SYSCALLS: [SyscallInfo; SYSCALL_COUNT] = [
     SyscallInfo {
         id: SyscallId::Exit,
         name: "exit",
+        category: SyscallCategory::Process,
+        argument_count: 1,
+        arguments: ["status", "", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Write,
         name: "write",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["fd", "buffer_ptr", "length", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Read,
         name: "read",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["fd", "buffer_ptr", "length", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Open,
         name: "open",
+        category: SyscallCategory::File,
+        argument_count: 4,
+        arguments: ["path_ptr", "path_len", "flags", "mode", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Close,
         name: "close",
+        category: SyscallCategory::File,
+        argument_count: 1,
+        arguments: ["handle", "", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::FileRead,
         name: "file_read",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["handle", "buffer_ptr", "length", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::FileWrite,
         name: "file_write",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["handle", "buffer_ptr", "length", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Seek,
         name: "seek",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["handle", "offset", "whence", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Stat,
         name: "stat",
+        category: SyscallCategory::File,
+        argument_count: 3,
+        arguments: ["path_ptr", "path_len", "stat_ptr", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::ReadDir,
         name: "readdir",
+        category: SyscallCategory::File,
+        argument_count: 2,
+        arguments: ["handle", "entry_ptr", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::MapMemory,
         name: "map_memory",
+        category: SyscallCategory::Memory,
+        argument_count: 5,
+        arguments: ["address", "length", "flags", "handle", "offset", ""],
     },
     SyscallInfo {
         id: SyscallId::UnmapMemory,
         name: "unmap_memory",
+        category: SyscallCategory::Memory,
+        argument_count: 2,
+        arguments: ["address", "length", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::HeapAlloc,
         name: "heap_alloc",
+        category: SyscallCategory::Memory,
+        argument_count: 2,
+        arguments: ["size", "alignment", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::HeapFree,
         name: "heap_free",
+        category: SyscallCategory::Memory,
+        argument_count: 2,
+        arguments: ["address", "size", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::ClockGetTime,
         name: "clock_gettime",
+        category: SyscallCategory::Time,
+        argument_count: 2,
+        arguments: ["clock_id", "timespec_ptr", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Sleep,
         name: "sleep",
+        category: SyscallCategory::Time,
+        argument_count: 1,
+        arguments: ["nanoseconds", "", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::GetPid,
         name: "getpid",
+        category: SyscallCategory::Process,
+        argument_count: 0,
+        arguments: ["", "", "", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Spawn,
         name: "spawn",
+        category: SyscallCategory::Process,
+        argument_count: 4,
+        arguments: ["path_ptr", "path_len", "argv_ptr", "flags", "", ""],
     },
     SyscallInfo {
         id: SyscallId::Wait,
         name: "wait",
+        category: SyscallCategory::Process,
+        argument_count: 3,
+        arguments: ["pid", "status_ptr", "options", "", "", ""],
     },
     SyscallInfo {
         id: SyscallId::GetAbiVersion,
         name: "get_abi_version",
+        category: SyscallCategory::SystemInfo,
+        argument_count: 0,
+        arguments: ["", "", "", "", "", ""],
     },
 ];
 
@@ -131,6 +205,12 @@ pub const SYSCALLS: [SyscallInfo; SYSCALL_COUNT] = [
 pub struct SyscallResult {
     pub value: u64,
     pub error: u64,
+}
+
+pub fn syscall_info(number: u64) -> Option<&'static SyscallInfo> {
+    let index = usize::try_from(number).ok()?;
+    let info = SYSCALLS.get(index)?;
+    (info.id as usize == index).then_some(info)
 }
 
 impl SyscallResult {
@@ -147,39 +227,13 @@ impl SyscallResult {
 }
 
 pub fn dispatch(number: u64, _arguments: [u64; 6]) -> SyscallResult {
-    match syscall_id(number) {
+    match syscall_info(number).map(|info| info.id) {
         Some(SyscallId::GetAbiVersion) => {
             let version = (u64::from(SYSCALL_ABI_MAJOR) << 16) | u64::from(SYSCALL_ABI_MINOR);
             SyscallResult::success(version)
         }
         Some(_) | None => SyscallResult::not_implemented(),
     }
-}
-
-fn syscall_id(number: u64) -> Option<SyscallId> {
-    Some(match number {
-        0 => SyscallId::Exit,
-        1 => SyscallId::Write,
-        2 => SyscallId::Read,
-        3 => SyscallId::Open,
-        4 => SyscallId::Close,
-        5 => SyscallId::FileRead,
-        6 => SyscallId::FileWrite,
-        7 => SyscallId::Seek,
-        8 => SyscallId::Stat,
-        9 => SyscallId::ReadDir,
-        10 => SyscallId::MapMemory,
-        11 => SyscallId::UnmapMemory,
-        12 => SyscallId::HeapAlloc,
-        13 => SyscallId::HeapFree,
-        14 => SyscallId::ClockGetTime,
-        15 => SyscallId::Sleep,
-        16 => SyscallId::GetPid,
-        17 => SyscallId::Spawn,
-        18 => SyscallId::Wait,
-        19 => SyscallId::GetAbiVersion,
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
@@ -192,7 +246,24 @@ mod tests {
         for (number, info) in SYSCALLS.iter().enumerate() {
             assert_eq!(info.id as usize, number);
             assert!(!info.name.is_empty());
+            assert!(info.argument_count <= info.arguments.len() as u8);
+            assert!(info.arguments[usize::from(info.argument_count)..]
+                .iter()
+                .all(|argument| argument.is_empty()));
+            assert_eq!(syscall_info(number as u64), Some(info));
         }
+    }
+
+    #[test]
+    fn syscall_numbers_are_unique_and_out_of_range_numbers_are_rejected() {
+        for (index, info) in SYSCALLS.iter().enumerate() {
+            assert!(!SYSCALLS[index + 1..]
+                .iter()
+                .any(|other| other.id == info.id));
+        }
+
+        assert_eq!(syscall_info(SYSCALL_COUNT as u64), None);
+        assert_eq!(syscall_info(u64::MAX), None);
     }
 
     #[test]

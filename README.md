@@ -33,12 +33,18 @@ are not executed as commands.
 
 The freestanding kernel defines 20 numbered syscall slots in
 `kernel-freestanding/syscall-abi` as the planned kernel/application
-interface. The ABI is currently a kernel-side dispatcher only: `get_abi_version`
-works, while the other calls return `ENOSYS` until their kernel services exist.
-There is not yet a user-mode transition or syscall CPU entry point, so `.apn`
-applications cannot call these entries yet. Safe user-memory access, process
-management, filesystem support, and the `.apn` loader must be added before
-application syscalls can be enabled.
+interface. Each ID has category and argument metadata; assigned IDs are kept
+stable as the ABI grows. The initial set covers process, file, memory, time,
+and system-information calls. `get_abi_version` works through the kernel-side
+dispatcher; the other 19 slots return `ENOSYS` until their services exist.
+The ABI defines an x86-64 register convention, but there is not yet a
+user-mode transition or CPU syscall entry point, so `.apn` applications cannot
+invoke it yet. Safe user-memory access, process management, filesystem
+support, and the `.apn` loader must be added before app syscalls can be enabled.
+Device-control and IPC calls can be added later without renumbering these IDs.
+
+The `alpha>` prompt is only for verifying keyboard input; Enter does not run
+commands.
 
 Test the syscall ABI from the `kernel-freestanding` directory:
 
