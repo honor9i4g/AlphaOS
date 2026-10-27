@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "alphaos-bootloader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "uefi",
 ]
 
 [[package]]
 name = "alphaos-kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "uefi",
 ]
