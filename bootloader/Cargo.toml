@@ -1,7 +1,7 @@
 [package]
 name = "alphaos-bootloader"
 version = "0.2.0"
-edition = "2022"
+edition = "2024"
 
 [[bin]]
 name = "AlphaOS-Bootloader"
