@@ -12,7 +12,7 @@ env:
 
 jobs:
   build:
-    name: Format and build AlphaOS kernels
+    name: Format and build AlphaOS boot images
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -20,6 +20,12 @@ jobs:
 
       - name: Install Rust target
         run: rustup target add x86_64-unknown-uefi x86_64-unknown-none
+
+      - name: Check UEFI boot manager formatting
+        run: cargo fmt -p alphaos-bootloader -- --check
+
+      - name: Build UEFI boot manager
+        run: cargo build --release --target x86_64-unknown-uefi -p alphaos-bootloader
 
       - name: Test beta kernel
         working-directory: kernel-freestanding
@@ -32,7 +38,12 @@ jobs:
       - name: Test syscall ABI
         working-directory: kernel-freestanding/syscall-abi
         run: cargo test --target x86_64-unknown-linux-gnu
-        
+
+      - name: Stage boot manager
+        run: |
+          mkdir -p esp/EFI/BOOT
+          cp target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi esp/EFI/BOOT/BOOTX64.EFI
+
       - name: Upload bootable EFI files
         uses: actions/upload-artifact@v4
         with:

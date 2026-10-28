@@ -7,21 +7,24 @@ without losing the existing QEMU-testable shell.
 
 ## Features
 
-- Separate UEFI bootloader and kernel images
+- Custom UEFI text boot manager with a timed, keyboard-selectable boot menu
+- Separate UEFI boot manager and classic kernel images
 - Framebuffer text using the UEFI Graphics Output Protocol and a built-in
   8x8 bitmap font
 - Basic keyboard-driven shell with Shift and Backspace support
 - Built-in shell commands: `help`, `clear`, `info`, `version`, `uname`,
   `whoami`, `echo`, `uptime`, `time`, `ticks`, `calc`, `shutdown`, `restart`,
   and `commands`
-- GitHub Actions workflow that builds the UEFI image pair and the freestanding
+- GitHub Actions workflow that builds the UEFI boot manager and freestanding
   kernel prototype, then packages the UEFI ESP files
 - A freestanding `x86_64-unknown-none` kernel prototype that receives a
   framebuffer through the Limine boot protocol
 
 This is an early learning project, not a general-purpose operating system. It
 does not currently provide a filesystem, networking, or process management.
-The existing shell kernel is still built as a UEFI-loadable EFI application.
+The UEFI boot manager defaults to the existing shell kernel and offers an
+optional Limine entry for the freestanding kernel and a Windows Boot Manager
+entry when Windows is installed at its standard path on the same ESP.
 The new freestanding kernel is an early prototype with polled PS/2 keyboard
 input and a basic text prompt. It does not yet replace the UEFI shell or
 provide interrupts, memory management, commands, or application support.
@@ -75,18 +78,28 @@ rustup target add x86_64-unknown-none
 
 ## Build
 
-Build both images from the repository root:
+Build the UEFI boot manager from the repository root:
 
 ```sh
-cargo build --release --target x86_64-unknown-uefi --workspace
+cargo build --release --target x86_64-unknown-uefi -p alphaos-bootloader
 ```
 
 The build creates:
 
 ```text
 target/x86_64-unknown-uefi/release/AlphaOS-Bootloader.efi
-target/x86_64-unknown-uefi/release/AlphaOS-Kernel.efi
 ```
+
+The existing classic kernel image is kept in `esp/EFI/BOOT/ALPHAKRN.EFI`.
+Build the boot manager separately; the legacy kernel package may need Rust
+edition-2024 compatibility updates before it can be rebuilt with newer Rust
+toolchains.
+
+On startup, the UEFI boot manager displays a menu for the classic kernel, the
+freestanding kernel through Limine, and Windows Boot Manager. The classic
+kernel is the default and starts after five seconds. Use the arrow keys and
+Enter, or press `1`, `2`, or `3`; navigation and other non-selection keys pause
+the automatic countdown.
 
 Build the freestanding kernel prototype separately:
 
@@ -110,12 +123,16 @@ Prepare the repository's `esp` folder in PowerShell:
 New-Item -ItemType Directory -Force .\esp\EFI\BOOT | Out-Null
 Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS-Bootloader.efi `
   .\esp\EFI\BOOT\BOOTX64.EFI -Force
-Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS-Kernel.efi `
-  .\esp\EFI\BOOT\ALPHAKRN.EFI -Force
 ```
 
 Use the `esp` folder to create a FAT-formatted ESP image, or copy its contents
-to an existing ESP. Both EFI files must be present at the paths above.
+to an existing ESP. Keep the existing `ALPHAKRN.EFI` kernel file in place.
+To enable the freestanding menu entry, also copy the Limine UEFI executable to
+`esp/EFI/BOOT/LIMINE.EFI`, `kernel-freestanding/limine.conf` to the ESP root as
+`limine.conf`, and the built kernel ELF to `esp/boot/alphaos-kernel`. Without
+those optional files, use the classic entry.
+The Windows entry chainloads
+`EFI/Microsoft/Boot/bootmgfw.efi` from the same ESP when present.
 
 ## Run in QEMU
 
@@ -124,17 +141,15 @@ ESP containing both files as a bootable drive. The exact firmware and disk
 image paths depend on your QEMU installation. Secure Boot must be disabled
 unless you sign both EFI images with keys trusted by the firmware.
 
-The current QEMU instructions boot the existing UEFI shell. After the
-bootloader starts that kernel, type `help` and press Enter to see its commands.
-To test the freestanding kernel, build it and create a FAT ESP containing the
-Limine UEFI executable at `EFI/BOOT/BOOTX64.EFI`, the repository's
-`kernel-freestanding/limine.conf`, and the kernel ELF at
-`boot/alphaos-kernel`. Boot that ESP using UEFI firmware. If the UEFI shell
-opens instead of Limine, run `map -r`, switch to the filesystem containing the
-ESP (usually `fs0:`), then run `\EFI\BOOT\BOOTX64.EFI`. Click the QEMU window
-and try typing `hello`, Backspace, and Enter at the `alpha>` prompt. The
-freestanding kernel currently polls the emulated PS/2 keyboard; it does not yet
-support USB keyboard drivers.
+The boot manager starts the classic UEFI shell kernel by default. Choose option
+2 to start the freestanding kernel through Limine after adding its optional
+files as described above, or option 3 to chainload Windows when its EFI file is
+on the same ESP. Click the QEMU window and try typing `hello`, Backspace, and
+Enter at the `alpha>` prompt. The freestanding kernel currently polls the
+emulated PS/2 keyboard; it does not yet support USB keyboard drivers.
+If OVMF opens its UEFI Shell instead of the boot manager, run `map -r`, switch
+to the ESP filesystem (usually `fs0:`), then enter
+`\EFI\BOOT\BOOTX64.EFI`.
 
 Use `calc 12 * 3`, `echo hello`, `uptime`, or `help calc` to try the shell.
 The `shutdown` and `restart` commands use UEFI runtime services to power off or
@@ -150,14 +165,15 @@ once AlphaOS takes over. The firmware splash may still appear briefly before
 the bootloader starts; changing that initial firmware behavior requires a
 firmware setting or a custom OVMF build.
 
-GitHub Actions builds both EFI images and the freestanding kernel prototype.
-It uploads the two EFI images together as the `alphaos-uefi` workflow artifact.
+GitHub Actions builds the UEFI boot manager and freestanding kernel prototype.
+It packages the boot manager with the existing classic kernel image and
+uploads both as the `alphaos-uefi` workflow artifact.
 
 ## Project layout
 
 ```text
 bootloader/
-  src/main.rs   Loads ALPHAKRN.EFI from the ESP and starts it through UEFI
+  src/main.rs   UEFI boot menu; starts the classic kernel or chainloads Limine
 kernel/
   src/main.rs   Existing UEFI kernel entry point, graphics setup, and shell handoff
   src/font.rs   Built-in bitmap font
