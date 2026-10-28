@@ -43,13 +43,13 @@ calls. Device access uses device IDs and handles; IPC uses message channels and
 shared-memory handles rather than copying Linux's `ioctl`, `pipe`, or `socket`
 interface. Existing memory mapping can map a shared-memory handle.
 
-Only `get_abi_version` works through the kernel-side dispatcher; the other 30
-slots return `ENOSYS` until their services exist. These definitions are the
-planned ABI, not a fully operational syscall implementation. The ABI defines
-an x86-64 register convention, but there is not yet a user-mode transition or
-CPU syscall entry point, so `.apn` applications cannot invoke it yet. Safe
-user-memory access, process management, filesystem/device services, and the
-`.apn` loader must be added before app syscalls can be enabled.
+The freestanding kernel prototype can enter ring 3 and execute its x86-64
+`SYSCALL` entry point. Its built-in test program currently exercises four
+calls: `get_abi_version`, `getpid` (fixed PID 1), `read` (one keyboard byte
+from fd 0), and `write` (console output to fd 1 or 2). The remaining 27 calls
+return `ENOSYS`. This is a syscall-entry prototype, not `.apn` application
+support: process management, filesystem/device services, an application
+loader, and robust exception handling are still missing.
 
 The `alpha>` prompt is only for verifying keyboard input; Enter does not run
 commands.
