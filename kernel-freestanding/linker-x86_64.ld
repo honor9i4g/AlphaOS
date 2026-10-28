@@ -14,6 +14,7 @@ SECTIONS
 
     .text : {
         *(.text .text.*)
+        *(.usercode)
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
