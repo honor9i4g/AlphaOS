@@ -327,7 +327,7 @@ impl Console {
         self.draw_string(
             Self::LEFT,
             Self::TOP + 48,
-            "Syscall ABI 1.0: 20 reserved calls",
+            "Syscall ABI 1.1: 31 defined, entry not implemented",
             0xB0,
             0xB0,
             0xB0,
