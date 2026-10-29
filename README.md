@@ -36,7 +36,7 @@ are not executed as commands.
 
 The freestanding kernel defines 31 numbered syscall slots in
 `kernel-freestanding/syscall-abi` as the planned kernel/application
-interface (ABI version 1.1). Each ID has category and argument metadata;
+interface (ABI version 1.2). Each ID has category and argument metadata;
 assigned IDs are kept stable as the ABI grows. The custom AlphaOS set covers
 process, file, memory, time, system-information, device, and communication
 calls. Device access uses device IDs and handles; IPC uses message channels and
@@ -44,12 +44,21 @@ shared-memory handles rather than copying Linux's `ioctl`, `pipe`, or `socket`
 interface. Existing memory mapping can map a shared-memory handle.
 
 The freestanding kernel prototype can enter ring 3 and execute its x86-64
-`SYSCALL` entry point. Its built-in test program currently exercises four
-calls: `get_abi_version`, `getpid` (fixed PID 1), `read` (one keyboard byte
-from fd 0), and `write` (console output to fd 1 or 2). The remaining 27 calls
-return `ENOSYS`. This is a syscall-entry prototype, not `.apn` application
-support: process management, filesystem/device services, an application
-loader, and robust exception handling are still missing.
+`SYSCALL` entry point. Its built-in test program exercises ten calls:
+`get_abi_version`, `getpid` (fixed PID 1), `get_system_info` (ABI, allocator,
+and framebuffer information), `read` (one keyboard byte from fd 0), `write`
+(console output to fd 1 or 2), and the device calls `device_list`,
+`device_open`, `device_read`, `device_write`, and `close` for the built-in
+keyboard and framebuffer. Device ID 1 is the read-only keyboard and device ID
+2 is the write-only framebuffer console; open access flags are 1 for read and
+2 for write. `device_list` returns `DeviceInfo` records, `device_open`
+produces a capability-checked handle, and `close` revokes that device's open
+access. Device reads return one keyboard byte and device writes render text to
+the framebuffer. The device registry is global to this single-process
+prototype and is not isolated between processes. The remaining 21 calls are
+not implemented and return `ENOSYS`. This is not `.apn` application support:
+general process management, filesystem services, an application loader, and
+robust exception handling are still missing.
 
 The `alpha>` prompt is only for verifying keyboard input; Enter does not run
 commands.

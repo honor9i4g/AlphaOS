@@ -8,6 +8,7 @@ mod keyboard;
 
 use alphaos_syscall_abi as syscall;
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicU32, Ordering};
 use limine::BaseRevision;
 use limine::framebuffer::MemoryModel;
 use limine::memory_map::EntryType;
@@ -55,8 +56,10 @@ static mut SYSCALL_KERNEL_STACK_TOP: u64 = 0;
 static mut SYSCALL_USER_STACK: u64 = 0;
 static mut SYSCALL_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut HHDM_OFFSET: u64 = 0;
+static mut ALLOCATOR_START: u64 = 0;
 static mut ALLOCATOR_NEXT: u64 = 0;
 static mut ALLOCATOR_END: u64 = 0;
+static OPENED_DEVICE_IDS: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C, align(16))]
 struct Gdt([u64; 5]);
@@ -163,7 +166,98 @@ global_asm!(
     "user_test_start:",
     "mov rax, 19",
     "syscall",
+    "mov rax, 25",
+    "xor rdi, rdi",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 8",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 25",
+    "mov rdi, 1",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 24",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 25",
+    "mov rdi, 2",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 24",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
     "mov rax, 16",
+    "syscall",
+    "mov rax, 20",
+    "mov rdi, 0x0000400000001000",
+    "mov rsi, 2",
+    "syscall",
+    "cmp rax, 2",
+    "jne 3f",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rsi, 0x0000400000001000",
+    "cmp dword ptr [rsi], 1",
+    "jne 3f",
+    "cmp dword ptr [rsi + 16], 2",
+    "jne 3f",
+    "mov rax, 21",
+    "mov rdi, 2",
+    "mov rsi, 2",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov r12, rax",
+    "mov rax, 21",
+    "mov rdi, 1",
+    "mov rsi, 1",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov r13, rax",
+    "mov rsi, 0x0000400000001000",
+    "mov byte ptr [rsi], 79",
+    "mov byte ptr [rsi + 1], 75",
+    "mov rax, 24",
+    "mov rdi, r12",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 2",
+    "syscall",
+    "cmp rax, 2",
+    "jne 3f",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 23",
+    "mov rdi, r13",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 1",
+    "syscall",
+    "cmp rax, 1",
+    "jne 3f",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 4",
+    "mov rdi, r13",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 4",
+    "mov rdi, r12",
+    "syscall",
+    "test rdx, rdx",
+    "jnz 3f",
+    "mov rax, 24",
+    "mov rdi, r12",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 1",
+    "syscall",
+    "cmp rdx, 9",
+    "jne 3f",
+    "mov rax, 1",
+    "mov rdi, 1",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 2",
     "syscall",
     "2:",
     "mov rax, 2",
@@ -179,6 +273,15 @@ global_asm!(
     "mov rdx, 1",
     "syscall",
     "jmp 2b",
+    "3:",
+    "mov rsi, 0x0000400000001000",
+    "mov byte ptr [rsi], 33",
+    "mov rax, 1",
+    "mov rdi, 1",
+    "mov rsi, 0x0000400000001000",
+    "mov rdx, 1",
+    "syscall",
+    "jmp 3b",
     ".global user_test_end",
     "user_test_end:",
 );
@@ -236,7 +339,7 @@ extern "C" fn kmain() -> ! {
 
     clear_screen(address, width, height, pitch, pixel_format);
     if syscall::SYSCALLS.len() != syscall::SYSCALL_COUNT
-        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0001
+        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0002
     {
         halt();
     }
@@ -386,6 +489,7 @@ fn initialize_page_allocator() -> bool {
 
     unsafe {
         core::ptr::addr_of_mut!(HHDM_OFFSET).write_volatile(hhdm.offset());
+        core::ptr::addr_of_mut!(ALLOCATOR_START).write_volatile(region_start);
         core::ptr::addr_of_mut!(ALLOCATOR_NEXT).write_volatile(region_start);
         core::ptr::addr_of_mut!(ALLOCATOR_END).write_volatile(region_end);
     }
@@ -537,6 +641,12 @@ extern "C" fn syscall_dispatch(
         Some(syscall::SyscallId::GetPid) => syscall::SyscallResult { value: 1, error: 0 },
         Some(syscall::SyscallId::Read) => read_console(arg0, arg1, arg2),
         Some(syscall::SyscallId::Write) => write_console(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Close) => close_device(arg0),
+        Some(syscall::SyscallId::DeviceList) => device_list(arg0, arg1),
+        Some(syscall::SyscallId::DeviceOpen) => device_open(arg0, arg1),
+        Some(syscall::SyscallId::DeviceRead) => device_read(arg0, arg1, arg2),
+        Some(syscall::SyscallId::DeviceWrite) => device_write(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetSystemInfo) => get_system_info(arg0, arg1, arg2),
         _ => syscall::SyscallResult {
             value: u64::MAX,
             error: syscall::ENOSYS,
@@ -545,23 +655,251 @@ extern "C" fn syscall_dispatch(
     result
 }
 
+fn device_list(entries: u64, capacity: u64) -> syscall::SyscallResult {
+    let devices = [
+        syscall::DeviceInfo {
+            id: syscall::DEVICE_KEYBOARD,
+            kind: syscall::DEVICE_KIND_INPUT,
+            capabilities: syscall::DEVICE_ACCESS_READ,
+            reserved: 0,
+        },
+        syscall::DeviceInfo {
+            id: syscall::DEVICE_FRAMEBUFFER,
+            kind: syscall::DEVICE_KIND_DISPLAY,
+            capabilities: syscall::DEVICE_ACCESS_WRITE,
+            reserved: 0,
+        },
+    ];
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    let count = capacity.min(devices.len());
+    let Some(bytes) = count.checked_mul(core::mem::size_of::<syscall::DeviceInfo>()) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    if bytes != 0 && !valid_user_range(entries, bytes) {
+        return syscall_error(syscall::EFAULT);
+    }
+
+    for (index, device) in devices.iter().take(count).enumerate() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(*device).cast::<u8>(),
+                (entries as *mut u8).add(index * core::mem::size_of::<syscall::DeviceInfo>()),
+                core::mem::size_of::<syscall::DeviceInfo>(),
+            );
+        }
+    }
+    syscall::SyscallResult {
+        value: count as u64,
+        error: 0,
+    }
+}
+
+fn device_open(device_id: u64, access: u64) -> syscall::SyscallResult {
+    let Ok(access) = u32::try_from(access) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if access == 0 || access & !(syscall::DEVICE_ACCESS_READ | syscall::DEVICE_ACCESS_WRITE) != 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let (id, capabilities) = match device_id {
+        id if id == u64::from(syscall::DEVICE_KEYBOARD) => {
+            (syscall::DEVICE_KEYBOARD, syscall::DEVICE_ACCESS_READ)
+        }
+        id if id == u64::from(syscall::DEVICE_FRAMEBUFFER) => {
+            (syscall::DEVICE_FRAMEBUFFER, syscall::DEVICE_ACCESS_WRITE)
+        }
+        _ => return syscall_error(syscall::ENODEV),
+    };
+    if access & !capabilities != 0 {
+        return syscall_error(syscall::EACCES);
+    }
+    OPENED_DEVICE_IDS.fetch_or(1 << id, Ordering::Release);
+    syscall::SyscallResult {
+        value: (u64::from(id) << 32) | u64::from(access),
+        error: 0,
+    }
+}
+
+fn device_read(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some((device_id, access)) = decode_device_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    if access & syscall::DEVICE_ACCESS_READ == 0 || device_id != syscall::DEVICE_KEYBOARD {
+        return syscall_error(syscall::EACCES);
+    }
+    read_console(0, buffer, length)
+}
+
+fn close_device(handle: u64) -> syscall::SyscallResult {
+    let Some((device_id, _)) = decode_device_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    OPENED_DEVICE_IDS.fetch_and(!(1 << device_id), Ordering::AcqRel);
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn device_write(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some((device_id, access)) = decode_device_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    if access & syscall::DEVICE_ACCESS_WRITE == 0 || device_id != syscall::DEVICE_FRAMEBUFFER {
+        return syscall_error(syscall::EACCES);
+    }
+    write_console(1, buffer, length)
+}
+
+fn decode_device_handle(handle: u64) -> Option<(u32, u32)> {
+    let device_id = u32::try_from(handle >> 32).ok()?;
+    let access = u32::try_from(handle & u64::from(u32::MAX)).ok()?;
+    let supported = match device_id {
+        syscall::DEVICE_KEYBOARD => syscall::DEVICE_ACCESS_READ,
+        syscall::DEVICE_FRAMEBUFFER => syscall::DEVICE_ACCESS_WRITE,
+        _ => return None,
+    };
+    if access == 0 || access & !supported != 0 {
+        return None;
+    }
+    if OPENED_DEVICE_IDS.load(Ordering::Acquire) & (1 << device_id) == 0 {
+        return None;
+    }
+    Some((device_id, access))
+}
+
+fn syscall_error(error: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult {
+        value: u64::MAX,
+        error,
+    }
+}
+
+fn get_system_info(kind: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let mut info_bytes = [0_u8; core::mem::size_of::<syscall::MemoryInfo>()];
+    let size = match kind {
+        syscall::SYSTEM_INFO_ABI_VERSION => {
+            let info = syscall::AbiVersionInfo {
+                major: syscall::SYSCALL_ABI_MAJOR,
+                minor: syscall::SYSCALL_ABI_MINOR,
+                syscall_count: syscall::SYSCALL_COUNT as u32,
+            };
+            let size = core::mem::size_of_val(&info);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::addr_of!(info).cast::<u8>(),
+                    info_bytes.as_mut_ptr(),
+                    size,
+                );
+            }
+            size
+        }
+        syscall::SYSTEM_INFO_MEMORY => {
+            let start = unsafe { core::ptr::addr_of!(ALLOCATOR_START).read_volatile() };
+            let next = unsafe { core::ptr::addr_of!(ALLOCATOR_NEXT).read_volatile() };
+            let end = unsafe { core::ptr::addr_of!(ALLOCATOR_END).read_volatile() };
+            if start > next || next > end {
+                return syscall::SyscallResult {
+                    value: u64::MAX,
+                    error: syscall::EIO,
+                };
+            }
+            let info = syscall::MemoryInfo {
+                managed_bytes: end - start,
+                allocated_bytes: next - start,
+                available_bytes: end - next,
+            };
+            let size = core::mem::size_of_val(&info);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::addr_of!(info).cast::<u8>(),
+                    info_bytes.as_mut_ptr(),
+                    size,
+                );
+            }
+            size
+        }
+        syscall::SYSTEM_INFO_FRAMEBUFFER => {
+            let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
+            if console.is_null() {
+                return syscall::SyscallResult {
+                    value: u64::MAX,
+                    error: syscall::EIO,
+                };
+            }
+            let info = unsafe {
+                syscall::FramebufferInfo {
+                    width: (*console).width as u64,
+                    height: (*console).height as u64,
+                    pitch_bytes: (*console).pitch as u64,
+                }
+            };
+            let size = core::mem::size_of_val(&info);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::addr_of!(info).cast::<u8>(),
+                    info_bytes.as_mut_ptr(),
+                    size,
+                );
+            }
+            size
+        }
+        _ => {
+            return syscall::SyscallResult {
+                value: u64::MAX,
+                error: syscall::EINVAL,
+            };
+        }
+    };
+
+    let Ok(length) = usize::try_from(length) else {
+        return syscall::SyscallResult {
+            value: u64::MAX,
+            error: syscall::EFAULT,
+        };
+    };
+    if length < size {
+        return syscall::SyscallResult {
+            value: u64::MAX,
+            error: syscall::EINVAL,
+        };
+    }
+    if !valid_user_range(buffer, size) {
+        return syscall::SyscallResult {
+            value: u64::MAX,
+            error: syscall::EFAULT,
+        };
+    }
+
+    for offset in 0..size {
+        unsafe {
+            (buffer as *mut u8)
+                .add(offset)
+                .write_volatile(info_bytes[offset]);
+        }
+    }
+    syscall::SyscallResult {
+        value: size as u64,
+        error: 0,
+    }
+}
+
 fn read_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
     if fd != 0 {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 9,
+            error: syscall::EBADF,
         };
     }
     if length == 0 {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 22,
+            error: syscall::EINVAL,
         };
     }
     if !valid_user_range(buffer, 1) {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 14,
+            error: syscall::EFAULT,
         };
     }
 
@@ -570,7 +908,7 @@ fn read_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
         if console.is_null() {
             return syscall::SyscallResult {
                 value: u64::MAX,
-                error: 5,
+                error: syscall::EIO,
             };
         }
         let event = unsafe { (*console).keyboard.poll() };
@@ -594,26 +932,26 @@ fn write_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
     if fd != 1 && fd != 2 {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 9,
+            error: syscall::EBADF,
         };
     }
     let Ok(length) = usize::try_from(length) else {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 14,
+            error: syscall::EFAULT,
         };
     };
     if !valid_user_range(buffer, length) {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 14,
+            error: syscall::EFAULT,
         };
     }
     let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
     if console.is_null() {
         return syscall::SyscallResult {
             value: u64::MAX,
-            error: 5,
+            error: syscall::EIO,
         };
     }
 
@@ -757,7 +1095,7 @@ impl Console {
         self.draw_string(
             Self::LEFT,
             Self::TOP + 48,
-            "User syscalls: ABI, PID, console read/write",
+            "Syscalls: ABI, PID, system info, devices, console input/output",
             0xB0,
             0xB0,
             0xB0,

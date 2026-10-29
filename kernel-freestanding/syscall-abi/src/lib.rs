@@ -2,16 +2,70 @@
 
 //! Shared syscall numbers and register/result layout for the kernel and apps.
 //!
-//! The planned x86-64 entry places the syscall number in `RAX` and six
+//! The x86-64 syscall entry places the syscall number in `RAX` and six
 //! arguments in `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9`. A return value uses
 //! `RAX` for `value` and `RDX` for `error`; zero error means success, and a
-//! non-zero error is a positive errno value. The CPU entry is not implemented.
+//! non-zero error is a positive errno value. The freestanding kernel currently
+//! has a prototype entry path; this ABI does not imply that every service is
+//! implemented or that a general application runtime exists.
 
 pub const SYSCALL_ABI_MAJOR: u16 = 1;
-pub const SYSCALL_ABI_MINOR: u16 = 1;
+pub const SYSCALL_ABI_MINOR: u16 = 2;
 pub const SYSCALL_COUNT: usize = 31;
 
 pub const ENOSYS: u64 = 38;
+pub const EIO: u64 = 5;
+pub const EBADF: u64 = 9;
+pub const EACCES: u64 = 13;
+pub const EFAULT: u64 = 14;
+pub const ENODEV: u64 = 19;
+pub const EINVAL: u64 = 22;
+
+pub const SYSTEM_INFO_ABI_VERSION: u64 = 0;
+pub const SYSTEM_INFO_MEMORY: u64 = 1;
+pub const SYSTEM_INFO_FRAMEBUFFER: u64 = 2;
+
+pub const DEVICE_KEYBOARD: u32 = 1;
+pub const DEVICE_FRAMEBUFFER: u32 = 2;
+
+pub const DEVICE_ACCESS_READ: u32 = 1;
+pub const DEVICE_ACCESS_WRITE: u32 = 2;
+
+pub const DEVICE_KIND_INPUT: u32 = 1;
+pub const DEVICE_KIND_DISPLAY: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct AbiVersionInfo {
+    pub major: u16,
+    pub minor: u16,
+    pub syscall_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct MemoryInfo {
+    pub managed_bytes: u64,
+    pub allocated_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FramebufferInfo {
+    pub width: u64,
+    pub height: u64,
+    pub pitch_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub kind: u32,
+    pub capabilities: u32,
+    pub reserved: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -364,6 +418,16 @@ mod tests {
     }
 
     #[test]
+    fn system_information_structures_have_stable_c_layouts() {
+        assert_eq!(core::mem::size_of::<AbiVersionInfo>(), 8);
+        assert_eq!(core::mem::size_of::<MemoryInfo>(), 24);
+        assert_eq!(core::mem::size_of::<FramebufferInfo>(), 24);
+        assert_eq!(core::mem::size_of::<DeviceInfo>(), 16);
+        assert_ne!(SYSTEM_INFO_ABI_VERSION, SYSTEM_INFO_MEMORY);
+        assert_ne!(SYSTEM_INFO_MEMORY, SYSTEM_INFO_FRAMEBUFFER);
+    }
+
+    #[test]
     fn syscall_numbers_are_unique_and_out_of_range_numbers_are_rejected() {
         for (index, info) in SYSCALLS.iter().enumerate() {
             assert!(!SYSCALLS[index + 1..]
@@ -379,7 +443,7 @@ mod tests {
     fn get_abi_version_returns_major_minor_pair() {
         let result = dispatch(SyscallId::GetAbiVersion as u64, [0; 6]);
 
-        assert_eq!(result.value, 0x0001_0001);
+        assert_eq!(result.value, 0x0001_0002);
         assert_eq!(result.error, 0);
     }
 
