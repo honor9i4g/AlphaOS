@@ -1,5 +1,5 @@
-use uefi::runtime::ResetType;
 use uefi::Status;
+use uefi::runtime::ResetType;
 
 pub(super) fn shutdown(output_y: u32) -> ! {
     super::draw_line(output_y, "Shutting down...", 255, 255, 255);

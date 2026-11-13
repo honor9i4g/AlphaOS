@@ -18,7 +18,7 @@ struct KernelStack([u8; STACK_SIZE]);
 
 static mut KERNEL_STACK: KernelStack = KernelStack([0; STACK_SIZE]);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wcslen(string: *const u16) -> usize {
     let mut length = 0;
     while unsafe { *string.add(length) } != 0 {
@@ -40,8 +40,8 @@ core::arch::global_asm!(
     kernel_main = sym kernel_main,
 );
 
-extern "efiapi" {
-    fn enter_kernel(stack_top: u64, width: u64, height: u64) -> !;
+unsafe extern "efiapi" {
+    unsafe fn enter_kernel(stack_top: u64, width: u64, height: u64) -> !;
 }
 
 #[entry]
