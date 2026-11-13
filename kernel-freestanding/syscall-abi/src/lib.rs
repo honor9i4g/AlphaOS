@@ -10,7 +10,7 @@
 //! implemented or that a general application runtime exists.
 
 pub const SYSCALL_ABI_MAJOR: u16 = 1;
-pub const SYSCALL_ABI_MINOR: u16 = 2;
+pub const SYSCALL_ABI_MINOR: u16 = 3;
 pub const SYSCALL_COUNT: usize = 31;
 
 pub const ENOSYS: u64 = 38;
@@ -33,6 +33,122 @@ pub const DEVICE_ACCESS_WRITE: u32 = 2;
 
 pub const DEVICE_KIND_INPUT: u32 = 1;
 pub const DEVICE_KIND_DISPLAY: u32 = 2;
+
+pub const INPUT_EVENT_SYN: u16 = 0;
+pub const INPUT_EVENT_KEY: u16 = 1;
+pub const INPUT_SYN_DROPPED: u16 = 1;
+pub const INPUT_MODIFIER_SHIFT: u32 = 1 << 0;
+pub const INPUT_MODIFIER_CONTROL: u32 = 1 << 1;
+pub const INPUT_MODIFIER_ALT: u32 = 1 << 2;
+pub const INPUT_MODIFIER_CAPS_LOCK: u32 = 1 << 3;
+
+pub const KEY_EVENT_RELEASE: i32 = 0;
+pub const KEY_EVENT_PRESS: i32 = 1;
+pub const KEY_EVENT_REPEAT: i32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum KeyCode {
+    A = 0x04,
+    B = 0x05,
+    C = 0x06,
+    D = 0x07,
+    E = 0x08,
+    F = 0x09,
+    G = 0x0A,
+    H = 0x0B,
+    I = 0x0C,
+    J = 0x0D,
+    K = 0x0E,
+    L = 0x0F,
+    M = 0x10,
+    N = 0x11,
+    O = 0x12,
+    P = 0x13,
+    Q = 0x14,
+    R = 0x15,
+    S = 0x16,
+    T = 0x17,
+    U = 0x18,
+    V = 0x19,
+    W = 0x1A,
+    X = 0x1B,
+    Y = 0x1C,
+    Z = 0x1D,
+    Digit1 = 0x1E,
+    Digit2 = 0x1F,
+    Digit3 = 0x20,
+    Digit4 = 0x21,
+    Digit5 = 0x22,
+    Digit6 = 0x23,
+    Digit7 = 0x24,
+    Digit8 = 0x25,
+    Digit9 = 0x26,
+    Digit0 = 0x27,
+    Enter = 0x28,
+    Escape = 0x29,
+    Backspace = 0x2A,
+    Tab = 0x2B,
+    Space = 0x2C,
+    Minus = 0x2D,
+    Equal = 0x2E,
+    LeftBracket = 0x2F,
+    RightBracket = 0x30,
+    Backslash = 0x31,
+    Semicolon = 0x33,
+    Apostrophe = 0x34,
+    Grave = 0x35,
+    Comma = 0x36,
+    Period = 0x37,
+    Slash = 0x38,
+    CapsLock = 0x39,
+    F1 = 0x3A,
+    F2 = 0x3B,
+    F3 = 0x3C,
+    F4 = 0x3D,
+    F5 = 0x3E,
+    F6 = 0x3F,
+    F7 = 0x40,
+    F8 = 0x41,
+    F9 = 0x42,
+    F10 = 0x43,
+    F11 = 0x44,
+    F12 = 0x45,
+    PrintScreen = 0x46,
+    ScrollLock = 0x47,
+    Pause = 0x48,
+    Insert = 0x49,
+    Home = 0x4A,
+    PageUp = 0x4B,
+    Delete = 0x4C,
+    End = 0x4D,
+    PageDown = 0x4E,
+    Right = 0x4F,
+    Left = 0x50,
+    Down = 0x51,
+    Up = 0x52,
+    NumLock = 0x53,
+    KeypadSlash = 0x54,
+    KeypadEnter = 0x58,
+    LeftControl = 0xE0,
+    LeftShift = 0xE1,
+    LeftAlt = 0xE2,
+    LeftMeta = 0xE3,
+    RightControl = 0xE4,
+    RightShift = 0xE5,
+    RightAlt = 0xE6,
+    RightMeta = 0xE7,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct InputEvent {
+    pub event_type: u16,
+    pub code: u16,
+    pub value: i32,
+    pub modifiers: u32,
+    pub reserved: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -423,8 +539,23 @@ mod tests {
         assert_eq!(core::mem::size_of::<MemoryInfo>(), 24);
         assert_eq!(core::mem::size_of::<FramebufferInfo>(), 24);
         assert_eq!(core::mem::size_of::<DeviceInfo>(), 16);
+        assert_eq!(core::mem::size_of::<InputEvent>(), 16);
         assert_ne!(SYSTEM_INFO_ABI_VERSION, SYSTEM_INFO_MEMORY);
         assert_ne!(SYSTEM_INFO_MEMORY, SYSTEM_INFO_FRAMEBUFFER);
+    }
+
+    #[test]
+    fn input_event_key_codes_and_modifiers_are_stable() {
+        assert_eq!(KeyCode::A as u16, 0x04);
+        assert_eq!(KeyCode::Enter as u16, 0x28);
+        assert_eq!(KeyCode::LeftShift as u16, 0xE1);
+        assert_eq!(INPUT_EVENT_KEY, 1);
+        assert_eq!(INPUT_EVENT_SYN, 0);
+        assert_eq!(INPUT_SYN_DROPPED, 1);
+        assert_eq!(KEY_EVENT_RELEASE, 0);
+        assert_eq!(KEY_EVENT_PRESS, 1);
+        assert_eq!(KEY_EVENT_REPEAT, 2);
+        assert_eq!(INPUT_MODIFIER_SHIFT | INPUT_MODIFIER_CAPS_LOCK, 9);
     }
 
     #[test]
@@ -443,7 +574,7 @@ mod tests {
     fn get_abi_version_returns_major_minor_pair() {
         let result = dispatch(SyscallId::GetAbiVersion as u64, [0; 6]);
 
-        assert_eq!(result.value, 0x0001_0002);
+        assert_eq!(result.value, 0x0001_0003);
         assert_eq!(result.error, 0);
     }
 

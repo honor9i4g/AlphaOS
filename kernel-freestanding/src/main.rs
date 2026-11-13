@@ -4,7 +4,10 @@
 #[path = "../../kernel/src/font.rs"]
 #[allow(dead_code, unsafe_op_in_unsafe_fn)]
 mod font;
+mod input;
+mod interrupts;
 mod keyboard;
+mod ps2;
 
 use alphaos_syscall_abi as syscall;
 use core::arch::{asm, global_asm};
@@ -33,9 +36,7 @@ struct Console {
     pitch: usize,
     pixel_format: PixelFormat,
     cursor_y: usize,
-    input: [u8; 128],
-    input_len: usize,
-    keyboard: keyboard::Keyboard,
+    cursor_x: usize,
 }
 
 const PAGE_SIZE: u64 = 4096;
@@ -44,6 +45,7 @@ const USER_DATA_BASE: u64 = USER_CODE_BASE + PAGE_SIZE;
 const USER_STACK_BASE: u64 = USER_CODE_BASE + 2 * PAGE_SIZE;
 const USER_REGION_END: u64 = USER_CODE_BASE + 3 * PAGE_SIZE;
 const USER_STACK_TOP: u64 = USER_REGION_END;
+const USER_INPUT_TARGET: u64 = 1;
 
 #[repr(C, align(16))]
 struct KernelSyscallStack([u8; 16 * 1024]);
@@ -54,29 +56,15 @@ static mut SYSCALL_KERNEL_STACK_TOP: u64 = 0;
 #[used]
 #[unsafe(no_mangle)]
 static mut SYSCALL_USER_STACK: u64 = 0;
+#[used]
+#[unsafe(no_mangle)]
+static mut SYSCALL_SAVED_RAX: u64 = 0;
 static mut SYSCALL_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut HHDM_OFFSET: u64 = 0;
 static mut ALLOCATOR_START: u64 = 0;
 static mut ALLOCATOR_NEXT: u64 = 0;
 static mut ALLOCATOR_END: u64 = 0;
 static OPENED_DEVICE_IDS: AtomicU32 = AtomicU32::new(0);
-
-#[repr(C, align(16))]
-struct Gdt([u64; 5]);
-
-static GDT: Gdt = Gdt([
-    0,
-    0x00AF_9B00_0000_FFFF,
-    0x00CF_9300_0000_FFFF,
-    0x00CF_F300_0000_FFFF,
-    0x00AF_FB00_0000_FFFF,
-]);
-
-#[repr(C, packed)]
-struct DescriptorTablePointer {
-    limit: u16,
-    base: u64,
-}
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -103,21 +91,11 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 global_asm!(
-    ".global load_gdt_and_segments",
-    "load_gdt_and_segments:",
-    "lgdt [rdi]",
-    "push 0x08",
-    "lea rax, [rip + 2f]",
-    "push rax",
-    "retfq",
-    "2:",
-    "mov ax, 0x10",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov ss, ax",
-    "ret",
     ".global enter_user_mode",
     "enter_user_mode:",
+    "mov ax, 0x1b",
+    "mov ds, ax",
+    "mov es, ax",
     "mov rax, rdi",
     "mov rbx, rsi",
     "push 0x1b",
@@ -130,6 +108,12 @@ global_asm!(
     "syscall_entry:",
     "mov qword ptr [rip + SYSCALL_USER_STACK], rsp",
     "mov rsp, qword ptr [rip + SYSCALL_KERNEL_STACK_TOP]",
+    "mov qword ptr [rip + SYSCALL_SAVED_RAX], rax",
+    "mov ax, 0x10",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov ss, ax",
+    "mov rax, qword ptr [rip + SYSCALL_SAVED_RAX]",
     "push r11",
     "push rcx",
     "push r9",
@@ -159,6 +143,11 @@ global_asm!(
     "pop r9",
     "pop rcx",
     "pop r11",
+    "push rax",
+    "mov ax, 0x1b",
+    "mov ds, ax",
+    "mov es, ax",
+    "pop rax",
     "mov rsp, qword ptr [rip + SYSCALL_USER_STACK]",
     "sysretq",
     ".section .usercode,\"ax\"",
@@ -231,12 +220,17 @@ global_asm!(
     "mov rax, 23",
     "mov rdi, r13",
     "mov rsi, 0x0000400000001000",
-    "mov rdx, 1",
+    "mov rdx, 16",
     "syscall",
-    "cmp rax, 1",
+    "cmp rax, 16",
     "jne 3f",
     "test rdx, rdx",
     "jnz 3f",
+    "mov rsi, 0x0000400000001000",
+    "cmp word ptr [rsi], 1",
+    "jne 3f",
+    "cmp dword ptr [rsi + 4], 2",
+    "ja 3f",
     "mov rax, 4",
     "mov rdi, r13",
     "syscall",
@@ -287,7 +281,6 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    fn load_gdt_and_segments(table: *const DescriptorTablePointer);
     fn enter_user_mode(instruction_pointer: u64, stack_pointer: u64) -> !;
     fn syscall_entry();
     static user_test_start: u8;
@@ -339,22 +332,44 @@ extern "C" fn kmain() -> ! {
 
     clear_screen(address, width, height, pitch, pixel_format);
     if syscall::SYSCALLS.len() != syscall::SYSCALL_COUNT
-        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0002
+        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0003
     {
         halt();
     }
 
     let mut console = Console::new(address, width, height, pitch, pixel_format);
-    if !map_user_test_program() {
-        halt();
-    }
-
     unsafe {
         core::ptr::addr_of_mut!(SYSCALL_CONSOLE).write_volatile(&mut console);
         let stack_top = core::ptr::addr_of_mut!(KERNEL_SYSCALL_STACK.0)
             .cast::<u8>()
             .add(16 * 1024) as u64;
         core::ptr::addr_of_mut!(SYSCALL_KERNEL_STACK_TOP).write_volatile(stack_top);
+    }
+
+    interrupts::initialize();
+    if !ps2::initialize() {
+        draw_text(
+            address,
+            width,
+            height,
+            pitch,
+            pixel_format,
+            24,
+            160,
+            "PS/2 keyboard initialization failed",
+            0xFF,
+            0x40,
+            0x40,
+        );
+        halt();
+    }
+    if !map_user_test_program() {
+        halt();
+    }
+    input::set_foreground_target(Some(USER_INPUT_TARGET));
+    interrupts::enable_keyboard_irq();
+
+    unsafe {
         enter_user_mode(USER_CODE_BASE, USER_STACK_TOP);
     }
 }
@@ -581,12 +596,7 @@ fn map_user_test_program() -> bool {
 }
 
 fn configure_syscall_entry() {
-    let pointer = DescriptorTablePointer {
-        limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-        base: core::ptr::addr_of!(GDT) as u64,
-    };
     unsafe {
-        load_gdt_and_segments(&pointer);
         let efer = read_msr(0xC000_0080) | 1;
         write_msr(0xC000_0080, efer);
         write_msr(0xC000_0081, (0x10_u64 << 48) | (0x08_u64 << 32));
@@ -729,7 +739,7 @@ fn device_read(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult 
     if access & syscall::DEVICE_ACCESS_READ == 0 || device_id != syscall::DEVICE_KEYBOARD {
         return syscall_error(syscall::EACCES);
     }
-    read_console(0, buffer, length)
+    read_input_event(buffer, length)
 }
 
 fn close_device(handle: u64) -> syscall::SyscallResult {
@@ -902,6 +912,9 @@ fn read_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
             error: syscall::EFAULT,
         };
     }
+    if input::foreground_target() != Some(USER_INPUT_TARGET) {
+        return syscall_error(syscall::EACCES);
+    }
 
     loop {
         let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
@@ -911,20 +924,50 @@ fn read_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
                 error: syscall::EIO,
             };
         }
-        let event = unsafe { (*console).keyboard.poll() };
-        let character = match event {
-            Some(keyboard::KeyEvent::Character(character)) => character,
-            Some(keyboard::KeyEvent::Enter) => b'\n',
-            Some(keyboard::KeyEvent::Backspace) => 8,
-            None => {
-                core::hint::spin_loop();
-                continue;
-            }
+        let Some(event) = input::dequeue_for(USER_INPUT_TARGET) else {
+            interrupts::wait_for_interrupt();
+            continue;
+        };
+        let Some(character) = keyboard::event_to_ascii(&event) else {
+            continue;
         };
         unsafe {
             (buffer as *mut u8).write_volatile(character);
         }
         return syscall::SyscallResult { value: 1, error: 0 };
+    }
+}
+
+fn read_input_event(buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Ok(length) = usize::try_from(length) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    let event_size = core::mem::size_of::<syscall::InputEvent>();
+    if length < event_size {
+        return syscall_error(syscall::EINVAL);
+    }
+    if !valid_user_range(buffer, event_size) {
+        return syscall_error(syscall::EFAULT);
+    }
+    if input::foreground_target() != Some(USER_INPUT_TARGET) {
+        return syscall_error(syscall::EACCES);
+    }
+
+    loop {
+        if let Some(event) = input::dequeue_for(USER_INPUT_TARGET) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::addr_of!(event).cast::<u8>(),
+                    buffer as *mut u8,
+                    event_size,
+                );
+            }
+            return syscall::SyscallResult {
+                value: event_size as u64,
+                error: 0,
+            };
+        }
+        interrupts::wait_for_interrupt();
     }
 }
 
@@ -955,9 +998,10 @@ fn write_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
         };
     }
 
-    for offset in 0..length {
-        let character = unsafe { (buffer as *const u8).add(offset).read_volatile() };
-        unsafe {
+    unsafe {
+        (*console).hide_caret();
+        for offset in 0..length {
+            let character = (buffer as *const u8).add(offset).read_volatile();
             match character {
                 b'\n' | b'\r' => (*console).submit_line(),
                 8 => (*console).backspace(),
@@ -965,6 +1009,7 @@ fn write_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
                 _ => {}
             }
         }
+        (*console).draw_caret();
     }
     syscall::SyscallResult {
         value: length as u64,
@@ -986,7 +1031,7 @@ impl Console {
     const LEFT: usize = 24;
     const INPUT_X: usize = Self::LEFT + 7 * 8;
     const TOP: usize = 24;
-    const PROMPT_Y: usize = 80;
+    const PROMPT_Y: usize = 112;
     const LINE_HEIGHT: usize = 16;
     const BACKGROUND: (u8, u8, u8) = (0x10, 0x14, 0x1C);
     const TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
@@ -1005,61 +1050,46 @@ impl Console {
             pitch,
             pixel_format,
             cursor_y: Self::PROMPT_Y,
-            input: [0; 128],
-            input_len: 0,
-            keyboard: {
-                let mut keyboard = keyboard::Keyboard::new();
-                keyboard.flush_pending();
-                keyboard
-            },
+            cursor_x: Self::INPUT_X,
         };
         console.draw_header();
         console.draw_prompt();
+        console.draw_caret();
         console
     }
 
     fn type_character(&mut self, character: u8) {
-        let max_chars = self.width.saturating_sub(Self::INPUT_X) / 8;
-        if self.input_len >= self.input.len() - 1 || self.input_len >= max_chars {
+        if self.cursor_x.saturating_add(8) > self.width {
             return;
         }
 
-        self.input[self.input_len] = character;
-        self.input_len += 1;
         draw_text(
             self.address,
             self.width,
             self.height,
             self.pitch,
             self.pixel_format,
-            Self::INPUT_X + (self.input_len - 1) * 8,
+            self.cursor_x,
             self.cursor_y,
-            core::str::from_utf8(&self.input[self.input_len - 1..self.input_len]).unwrap_or(" "),
+            core::str::from_utf8(core::slice::from_ref(&character)).unwrap_or(" "),
             Self::TEXT.0,
             Self::TEXT.1,
             Self::TEXT.2,
         );
+        self.cursor_x = self.cursor_x.saturating_add(8);
     }
 
     fn backspace(&mut self) {
-        if self.input_len == 0 {
+        if self.cursor_x <= Self::INPUT_X {
             return;
         }
 
-        self.input_len -= 1;
-        self.input[self.input_len] = 0;
-        self.fill_rect(
-            Self::INPUT_X + self.input_len * 8,
-            self.cursor_y,
-            8,
-            8,
-            Self::BACKGROUND,
-        );
+        self.cursor_x -= 8;
+        self.fill_rect(self.cursor_x, self.cursor_y, 8, 8, Self::BACKGROUND);
     }
 
     fn submit_line(&mut self) {
-        self.input_len = 0;
-        self.input.fill(0);
+        self.cursor_x = Self::INPUT_X;
         self.cursor_y = self.cursor_y.saturating_add(Self::LINE_HEIGHT);
         if self.cursor_y + 8 >= self.height {
             clear_screen(
@@ -1073,6 +1103,14 @@ impl Console {
             self.draw_header();
         }
         self.draw_prompt();
+    }
+
+    fn draw_caret(&self) {
+        self.fill_rect(self.cursor_x, self.cursor_y + 7, 6, 1, Self::TEXT);
+    }
+
+    fn hide_caret(&self) {
+        self.fill_rect(self.cursor_x, self.cursor_y + 7, 6, 1, Self::BACKGROUND);
     }
 
     fn draw_header(&self) {
@@ -1095,7 +1133,15 @@ impl Console {
         self.draw_string(
             Self::LEFT,
             Self::TOP + 48,
-            "Syscalls: ABI, PID, system info, devices, console input/output",
+            "IRQ1 PS/2 input: key events routed to foreground PID 1",
+            0xB0,
+            0xB0,
+            0xB0,
+        );
+        self.draw_string(
+            Self::LEFT,
+            Self::TOP + 64,
+            "read(): translated bytes; device_read(): key events",
             0xB0,
             0xB0,
             0xB0,

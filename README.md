@@ -25,18 +25,17 @@ does not currently provide a filesystem, networking, or process management.
 The UEFI boot manager defaults to the existing shell kernel and offers an
 optional Limine entry for the freestanding kernel and a Windows Boot Manager
 entry when Windows is installed at its standard path on the same ESP.
-The new freestanding kernel is an early prototype with polled PS/2 keyboard
-input and a basic text prompt. It does not yet replace the UEFI shell or
-provide interrupts, memory management, commands, or application support.
-Keyboard input currently supports printable US-layout keys, Shift, Backspace,
-and Enter; Enter keeps the typed line on screen and opens a new prompt. Lines
-are not executed as commands.
+The freestanding kernel remains a prototype, but now has an IRQ1-driven PS/2
+keyboard path, a bounded input-event queue, and a basic ring-3 text console.
+Its visible underline caret follows output from the foreground test program.
+The prompt is for input testing only; Enter opens a new line and does not run
+commands.
 
 ## Freestanding syscall ABI
 
 The freestanding kernel defines 31 numbered syscall slots in
 `kernel-freestanding/syscall-abi` as the planned kernel/application
-interface (ABI version 1.2). Each ID has category and argument metadata;
+interface (ABI version 1.3). Each ID has category and argument metadata;
 assigned IDs are kept stable as the ABI grows. The custom AlphaOS set covers
 process, file, memory, time, system-information, device, and communication
 calls. Device access uses device IDs and handles; IPC uses message channels and
@@ -49,16 +48,27 @@ The freestanding kernel prototype can enter ring 3 and execute its x86-64
 and framebuffer information), `read` (one keyboard byte from fd 0), `write`
 (console output to fd 1 or 2), and the device calls `device_list`,
 `device_open`, `device_read`, `device_write`, and `close` for the built-in
-keyboard and framebuffer. Device ID 1 is the read-only keyboard and device ID
-2 is the write-only framebuffer console; open access flags are 1 for read and
-2 for write. `device_list` returns `DeviceInfo` records, `device_open`
-produces a capability-checked handle, and `close` revokes that device's open
-access. Device reads return one keyboard byte and device writes render text to
-the framebuffer. The device registry is global to this single-process
-prototype and is not isolated between processes. The remaining 21 calls are
-not implemented and return `ENOSYS`. This is not `.apn` application support:
-general process management, filesystem services, an application loader, and
-robust exception handling are still missing.
+keyboard and framebuffer. Device ID 1 is the read-only keyboard event stream
+and device ID 2 is the write-only framebuffer console; open access flags are 1
+for read and 2 for write. `device_list` returns `DeviceInfo` records,
+`device_open` produces a capability-checked handle, and `close` revokes that
+device's open access. Keyboard `device_read` returns the shared 16-byte
+`InputEvent` structure with a USB-HID-usage key code, press/release/repeat
+value, and modifier flags. `read` on fd 0 remains a byte-oriented interface
+that translates US-layout key presses. Both interfaces consume the same event
+queue and are routed to the single foreground test task (PID 1). The queue is
+bounded and reports overflow with a synthetic dropped-events record. The
+device registry and focus target are global to this single-process prototype.
+The remaining 21 calls return `ENOSYS`. This is not `.apn` application
+support: USB HID, a scheduler and multi-task focus switching, a VFS with
+`/dev/input` nodes, PTYs, an application loader, and exception recovery are
+still missing.
+
+The keyboard driver decodes PS/2 set-1 scan codes in the IRQ handler and
+publishes events; it does not draw or edit text there. The framebuffer console
+renders the user's writes and displays a static underline at the current
+insertion point. This prototype has no USB keyboard backend, multiple virtual
+terminals, or multiple processes to switch focus between.
 
 The `alpha>` prompt is only for verifying keyboard input; Enter does not run
 commands.
@@ -154,8 +164,8 @@ The boot manager starts the classic UEFI shell kernel by default. Choose option
 2 to start the freestanding kernel through Limine after adding its optional
 files as described above, or option 3 to chainload Windows when its EFI file is
 on the same ESP. Click the QEMU window and try typing `hello`, Backspace, and
-Enter at the `alpha>` prompt. The freestanding kernel currently polls the
-emulated PS/2 keyboard; it does not yet support USB keyboard drivers.
+Enter at the `alpha>` prompt. Keyboard input is currently PS/2-only; USB
+keyboard support is not implemented.
 If OVMF opens its UEFI Shell instead of the boot manager, run `map -r`, switch
 to the ESP filesystem (usually `fs0:`), then enter
 `\EFI\BOOT\BOOTX64.EFI`.
