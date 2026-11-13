@@ -113,21 +113,23 @@ pub unsafe fn draw_char(
     g: u8,
     b: u8,
 ) {
-    if fb.is_null() || ch < 32 || ch > 126 {
-        return;
-    }
-    let glyph = &FONT8X8[((ch - 32) as usize) * 8..((ch - 32) as usize) * 8 + 8];
-    for row in 0..8 {
-        for col in 0..8 {
-            if glyph[row] & (0x80 >> col) != 0 {
-                let px = x.saturating_add(col as u32);
-                let py = y.saturating_add(row as u32);
-                if (px as usize) < fb_width && (py as usize) < fb_height {
-                    let idx = ((py as usize) * fb_width + (px as usize)) * 4;
-                    *fb.add(idx) = b;
-                    *fb.add(idx + 1) = g;
-                    *fb.add(idx + 2) = r;
-                    *fb.add(idx + 3) = 255;
+    unsafe {
+        if fb.is_null() || ch < 32 || ch > 126 {
+            return;
+        }
+        let glyph = &FONT8X8[((ch - 32) as usize) * 8..((ch - 32) as usize) * 8 + 8];
+        for row in 0..8 {
+            for col in 0..8 {
+                if glyph[row] & (0x80 >> col) != 0 {
+                    let px = x.saturating_add(col as u32);
+                    let py = y.saturating_add(row as u32);
+                    if (px as usize) < fb_width && (py as usize) < fb_height {
+                        let idx = ((py as usize) * fb_width + (px as usize)) * 4;
+                        *fb.add(idx) = b;
+                        *fb.add(idx + 1) = g;
+                        *fb.add(idx + 2) = r;
+                        *fb.add(idx + 3) = 255;
+                    }
                 }
             }
         }

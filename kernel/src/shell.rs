@@ -420,13 +420,17 @@ fn key(sc: u8) -> u8 {
 }
 
 unsafe fn redraw() {
-    for i in 0..POS {
-        crate::video::draw_char(INPUT_X + i as u32 * 8, CY, BUF[i]);
+    unsafe {
+        for i in 0..POS {
+            crate::video::draw_char(INPUT_X + i as u32 * 8, CY, BUF[i]);
+        }
+        CX = INPUT_X + POS as u32 * 8;
     }
-    CX = INPUT_X + POS as u32 * 8;
 }
 
 unsafe fn draw_prompt() {
-    crate::video::draw_text(PROMPT_X, CY, "c: ", 0xFF, 0xFF, 0xFF);
-    CX = INPUT_X;
+    unsafe {
+        crate::video::draw_text(PROMPT_X, CY, "c: ", 0xFF, 0xFF, 0xFF);
+        CX = INPUT_X;
+    }
 }

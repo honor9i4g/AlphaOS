@@ -2,12 +2,14 @@ static mut LAST_COUNT: u16 = 0;
 static mut TICK_COUNT: u64 = 0;
 
 pub unsafe fn init() {
-    let divisor: u16 = 1193;
-    crate::port::out(0x43, 0x36);
-    crate::port::out(0x40, (divisor & 0xFF) as u8);
-    crate::port::out(0x40, (divisor >> 8) as u8);
-    LAST_COUNT = divisor;
-    TICK_COUNT = 0;
+    unsafe {
+        let divisor: u16 = 1193;
+        crate::port::out(0x43, 0x36);
+        crate::port::out(0x40, (divisor & 0xFF) as u8);
+        crate::port::out(0x40, (divisor >> 8) as u8);
+        LAST_COUNT = divisor;
+        TICK_COUNT = 0;
+    }
 }
 
 pub fn tick_count() -> u64 {
