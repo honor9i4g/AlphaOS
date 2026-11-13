@@ -60,8 +60,7 @@ impl Decoder {
             KeyCode::LeftControl | KeyCode::RightControl => {
                 self.set_modifier(
                     INPUT_MODIFIER_CONTROL,
-                    self.is_pressed(KeyCode::LeftControl)
-                        || self.is_pressed(KeyCode::RightControl),
+                    self.is_pressed(KeyCode::LeftControl) || self.is_pressed(KeyCode::RightControl),
                 );
             }
             KeyCode::LeftAlt | KeyCode::RightAlt => {
