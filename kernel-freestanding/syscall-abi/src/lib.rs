@@ -10,8 +10,8 @@
 //! implemented or that a general application runtime exists.
 
 pub const SYSCALL_ABI_MAJOR: u16 = 1;
-pub const SYSCALL_ABI_MINOR: u16 = 3;
-pub const SYSCALL_COUNT: usize = 31;
+pub const SYSCALL_ABI_MINOR: u16 = 4;
+pub const SYSCALL_COUNT: usize = 51;
 
 pub const ENOSYS: u64 = 38;
 pub const EIO: u64 = 5;
@@ -173,6 +173,18 @@ pub struct FramebufferInfo {
     pub height: u64,
     pub pitch_bytes: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FileStat {
+    pub size: u64,
+    pub mode: u32,
+    pub flags: u32,
+}
+
+pub const AF_INET: u32 = 2;
+pub const SOCK_STREAM: u32 = 1;
+pub const SOCK_DGRAM: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
