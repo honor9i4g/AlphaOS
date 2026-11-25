@@ -1,3 +1,7 @@
 (.gitignore)
 RELEASE-0.2.0.md
+_tmp_build.py
+_append_apply.py
+_fix.py
+_gen200.py
 target/

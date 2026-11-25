@@ -242,6 +242,88 @@ static NEXT_SPAWN_PID: AtomicU64 = AtomicU64::new(2);
 static EXIT_STATUS: AtomicU64 = AtomicU64::new(0);
 static EXITED: AtomicU8 = AtomicU8::new(0);
 
+const MAX_ENV_VARS: usize = 16;
+const MAX_ENV_KEY: usize = 32;
+const MAX_ENV_VAL: usize = 128;
+const MAX_TIMERS: usize = 8;
+const MAX_EVENTS: usize = 16;
+const MAX_PROC_NAME: usize = 32;
+const KLOG_SIZE: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct EnvVar { used: bool, key_len: usize, val_len: usize, key: [u8; MAX_ENV_KEY], val: [u8; MAX_ENV_VAL] }
+impl EnvVar { const fn empty() -> Self { Self { used: false, key_len: 0, val_len: 0, key: [0; MAX_ENV_KEY], val: [0; MAX_ENV_VAL] } } }
+#[derive(Clone, Copy)]
+struct TimerSlot { used: bool, interval_ms: u64, start_tick: u64 }
+impl TimerSlot { const fn empty() -> Self { Self { used: false, interval_ms: 0, start_tick: 0 } } }
+#[derive(Clone, Copy)]
+struct EventSlot { used: bool, signaled: bool }
+impl EventSlot { const fn empty() -> Self { Self { used: false, signaled: false } } }
+
+static mut CWD_BUF: [u8; 128] = [0; 128];
+static mut CWD_LEN: usize = 1;
+static mut ENV_VARS: [EnvVar; MAX_ENV_VARS] = [EnvVar::empty(); MAX_ENV_VARS];
+static mut SYS_NAME: [u8; 32] = *b"AlphaOS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+static mut SYS_NAME_LEN: usize = 7;
+static mut CONSOLE_MODE: u64 = 0;
+static mut TIMERS: [TimerSlot; MAX_TIMERS] = [TimerSlot::empty(); MAX_TIMERS];
+static mut EVENTS: [EventSlot; MAX_EVENTS] = [EventSlot::empty(); MAX_EVENTS];
+static mut KLOG: [u8; KLOG_SIZE] = [0; KLOG_SIZE];
+static mut KLOG_LEN: usize = 0;
+static mut RNG_STATE: u64 = 0x9E3779B97F4A7C15;
+static mut BOOT_TSC: u64 = 0;
+static mut PROC_NAMES: [[u8; MAX_PROC_NAME]; MAX_SPAWNED] = [[0; MAX_PROC_NAME]; MAX_SPAWNED];
+static mut PROC_NAME_LENS: [usize; MAX_SPAWNED] = [0; MAX_SPAWNED];
+static mut SC_UID: u32 = 0;
+static mut SC_GID: u32 = 0;
+static mut SC_LAST_ERROR: u64 = 0;
+static mut SC_THREAD_PRIORITY: [i32; 32] = [0; 32];
+static mut SC_MUTEXES: [u8; 64] = [0; 64]; // 0=free,1=unlocked,2=locked
+static mut SC_SEMS: [i32; 64] = [0; 64];
+static mut SC_SEMS_USED: [bool; 64] = [false; 64];
+static mut SC_CONDVARS: [bool; 64] = [false; 64];
+static mut SC_MSGQ: [[[u8; 256]; 8]; 16] = [[[0; 256]; 8]; 16];
+static mut SC_MSGQ_LEN: [[usize; 8]; 16] = [[0; 8]; 16];
+static mut SC_MSGQ_HEAD: [usize; 16] = [0; 16];
+static mut SC_MSGQ_TAIL: [usize; 16] = [0; 16];
+static mut SC_MSGQ_COUNT: [usize; 16] = [0; 16];
+static mut SC_MSGQ_USED: [bool; 16] = [false; 16];
+static mut SC_EVENTFD: [u64; 64] = [0; 64];
+static mut SC_EVENTFD_USED: [bool; 64] = [false; 64];
+static mut SC_SYMLINKS: [[u8; 128]; 32] = [[0; 128]; 32];
+static mut SC_SYMLINK_TARGETS: [[u8; 128]; 32] = [[0; 128]; 32];
+static mut SC_SYMLINK_LEN: [usize; 32] = [0; 32];
+static mut SC_SYMLINK_TLEN: [usize; 32] = [0; 32];
+static mut SC_SYMLINK_USED: [bool; 32] = [false; 32];
+static mut SC_FILE_MODE: [u32; 128] = [0o644; 128];
+static mut SC_ALARM_MS: u64 = 0;
+
+fn sc_set_last_error(e: u64) { unsafe { *core::ptr::addr_of_mut!(SC_LAST_ERROR) = e; } }
+fn sc_write_u32(ptr: u64, val: u32) -> Result<(), u64> { if ptr==0{return Ok(());} if let Err(e)=validate_user_buffer(ptr,4,true){return Err(e);} unsafe{core::ptr::write_unaligned(ptr as *mut u32,val);} Ok(()) }
+fn sc_copy_to_user(dst: u64, dst_len: u64, src: &[u8]) -> Result<u64, u64> {
+    let n = core::cmp::min(src.len(), dst_len as usize);
+    if n==0 { return Ok(0); }
+    if let Err(e)=validate_user_buffer(dst, n as u64, true){return Err(e);}
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, n); }
+    Ok(n as u64)
+}
+fn sc_copy_cstr_to_user(dst: u64, dst_len: u64, src: &[u8]) -> Result<u64, u64> {
+    if dst_len==0 { return Ok(0); }
+    let n = core::cmp::min(src.len(), (dst_len as usize).saturating_sub(1));
+    if let Err(e)=validate_user_buffer(dst, (n+1) as u64, true){return Err(e);}
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, n); *((dst as *mut u8).add(n)) = 0; }
+    Ok(n as u64)
+}
+fn sc_read_user(buf: u64, len: u64) -> Result<&'static [u8], u64> {
+    let n = len as usize;
+    if n==0 { return Ok(&[]); }
+    if let Err(e)=validate_user_buffer(buf, len, false){return Err(e);}
+    Ok(unsafe{core::slice::from_raw_parts(buf as *const u8, n)})
+}
+fn sc_ticks_ms() -> u64 { unsafe { read_tsc().wrapping_sub(BOOT_TSC) / 1_000_000 } }
+
+
+
 static KERNEL_LOCK: AtomicU8 = AtomicU8::new(0);
 
 fn lock_kernel() {
@@ -547,6 +629,10 @@ extern "C" fn kmain() -> ! {
             .cast::<u8>()
             .add(16 * 1024) as u64;
         core::ptr::addr_of_mut!(SYSCALL_KERNEL_STACK_TOP).write_volatile(stack_top);
+        BOOT_TSC = read_tsc();
+        CWD_BUF[0] = b'/';
+        CWD_LEN = 1;
+        RNG_STATE ^= read_tsc();
     }
 
     interrupts::initialize();
@@ -836,6 +922,2213 @@ unsafe fn write_msr(register: u32, value: u64) {
 }
 
 #[unsafe(no_mangle)]
+
+type SyscallResult = syscall::SyscallResult;
+
+fn syscall_errno(e: u64) -> u64 { e }
+
+fn validate_user_buffer(ptr: u64, len: u64, _write: bool) -> Result<(), u64> {
+    let Ok(l) = usize::try_from(len) else { return Err(syscall::EINVAL); };
+    if l == 0 { return Ok(()); }
+    if !valid_user_range(ptr, l) { return Err(syscall::EFAULT); }
+    Ok(())
+}
+
+fn user_write_buf(ptr: u64, len: u64, src: &[u8]) -> Result<u64, u64> {
+    if len == 0 { return Ok(0); }
+    let n = core::cmp::min(len as usize, src.len());
+    validate_user_buffer(ptr, n as u64, true).map_err(syscall_errno)?;
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, n); }
+    Ok(n as u64)
+}
+
+fn user_read_bytes(ptr: u64, len: u64) -> Result<&'static [u8], u64> {
+    if len == 0 { return Ok(&[]); }
+    validate_user_buffer(ptr, len, false).map_err(syscall_errno)?;
+    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
+}
+
+fn user_read_path(ptr: u64, len: u64) -> Result<&'static str, u64> {
+    let bytes = user_read_bytes(ptr, len)?;
+    core::str::from_utf8(bytes).map_err(|_| syscall_errno(syscall::EINVAL))
+}
+
+fn resolve_path(path: &str) -> [u8; 128] {
+    let mut out = [0u8; 128];
+    let base: &[u8] = if path.starts_with('/') { b"" } else { unsafe { &CWD_BUF[..CWD_LEN] } };
+    let mut tmp = [0u8; 256];
+    let mut tlen = 0usize;
+    for &b in base.iter().chain(b"/".iter()).chain(path.as_bytes().iter()) {
+        if tlen < tmp.len() { tmp[tlen] = b; tlen += 1; }
+    }
+    let mut parts: [[u8; 64]; 16] = [[0;64];16];
+    let mut plens: [usize;16] = [0;16];
+    let mut pcount = 0usize;
+    let mut i = 0usize;
+    while i < tlen {
+        while i < tlen && tmp[i] == b'/' { i += 1; }
+        if i >= tlen { break; }
+        let start = i;
+        while i < tlen && tmp[i] != b'/' { i += 1; }
+        let seg = &tmp[start..i];
+        if seg == b"." { continue; }
+        if seg == b".." { if pcount > 0 { pcount -= 1; } continue; }
+        if pcount < 16 {
+            let l = core::cmp::min(seg.len(), 64);
+            parts[pcount][..l].copy_from_slice(&seg[..l]);
+            plens[pcount] = l;
+            pcount += 1;
+        }
+    }
+    if pcount == 0 { out[0] = b'/'; return out; }
+    let mut n = 0usize;
+    for pi in 0..pcount {
+        if n < 127 { out[n] = b'/'; n += 1; }
+        let l = core::cmp::min(plens[pi], 127-n);
+        out[n..n+l].copy_from_slice(&parts[pi][..l]);
+        n += l;
+    }
+    if n == 0 { out[0] = b'/'; }
+    out
+}
+
+fn resolved_len(p: &[u8;128]) -> usize { let mut n=0; while n<128 && p[n]!=0 { n+=1; } if n==0 {1} else {n} }
+
+fn with_fs<R>(f: impl FnOnce(&mut [FsFile; MAX_FS_FILES]) -> R) -> R { unsafe { init_fs(); f(&mut *core::ptr::addr_of_mut!(FS_FILES)) } }
+
+fn find_fs(path: &[u8;128], plen: usize) -> Option<usize> {
+    with_fs(|fs| { for i in 0..MAX_FS_FILES { if fs[i].used && fs[i].name_len == plen && fs[i].name[..plen] == path[..plen] { return Some(i); } } None })
+}
+
+fn syscall_getcwd(buf: u64, len: u64) -> SyscallResult {
+    if len == 0 { return syscall_error(syscall::EINVAL); }
+    let (ptr, n) = unsafe { (core::ptr::addr_of!(CWD_BUF).cast::<u8>(), CWD_LEN) };
+    let copy_n = core::cmp::min(n, (len as usize).saturating_sub(1));
+    if let Err(e) = validate_user_buffer(buf, len, true) { return syscall_error(e); }
+    unsafe { core::ptr::copy_nonoverlapping(ptr, buf as *mut u8, copy_n); *((buf as *mut u8).add(copy_n)) = 0; }
+    SyscallResult::success(copy_n as u64)
+}
+
+fn syscall_setcwd(path_ptr: u64, path_len: u64) -> SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p) => p, Err(e) => return syscall_error(e) };
+    let resolved = resolve_path(path);
+    let rlen = resolved_len(&resolved);
+    if !(rlen == 1 && resolved[0] == b'/') {
+        match find_fs(&resolved, rlen) { Some(i) => { if !with_fs(|fs| fs[i].is_dir) { return syscall_error(syscall::ENOTDIR); } }, None => return syscall_error(syscall::ENOENT) }
+    }
+    unsafe { let dst = core::ptr::addr_of_mut!(CWD_BUF).cast::<u8>();
+        core::ptr::write_bytes(dst, 0, 128);
+        core::ptr::copy_nonoverlapping(resolved.as_ptr(), dst, rlen);
+        CWD_LEN = rlen; }
+    SyscallResult::success(0)
+}
+
+fn syscall_mkdir(path_ptr: u64, path_len: u64) -> SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    if find_fs(&resolved, rlen).is_some() { return syscall_error(syscall::EEXIST); }
+    with_fs(|fs| {
+        for i in 0..MAX_FS_FILES { if !fs[i].used {
+            fs[i].used = true; fs[i].is_dir = true; fs[i].size = 0; let nlm = core::cmp::min(rlen,64); fs[i].name = [0;64]; fs[i].name[..nlm].copy_from_slice(&resolved[..nlm]); fs[i].name_len = nlm;
+            return SyscallResult::success(0);
+        }}
+        syscall_error(syscall::ENOSPC)
+    })
+}
+
+fn syscall_rmdir(path_ptr: u64, path_len: u64) -> SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    if rlen == 1 && resolved[0] == b'/' { return syscall_error(syscall::EINVAL); }
+    let idx = match find_fs(&resolved, rlen) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    let is_dir = with_fs(|fs| fs[idx].is_dir);
+    if !is_dir { return syscall_error(syscall::ENOTDIR); }
+    let not_empty = with_fs(|fs| {
+        for i in 0..MAX_FS_FILES { if fs[i].used && i != idx && fs[i].name_len > rlen && fs[i].name[..rlen] == resolved[..rlen] && fs[i].name[rlen] == b'/' { return true; } }
+        false
+    });
+    if not_empty { return syscall_error(syscall::ENOTEMPTY); }
+    with_fs(|fs| { fs[idx] = FsFile::empty(); });
+    SyscallResult::success(0)
+}
+
+fn syscall_unlink(path_ptr: u64, path_len: u64) -> SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    let idx = match find_fs(&resolved, rlen) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    let is_dir = with_fs(|fs| fs[idx].is_dir);
+    if is_dir { return syscall_error(syscall::EISDIR); }
+    with_fs(|fs| { fs[idx] = FsFile::empty(); });
+    SyscallResult::success(0)
+}
+
+fn syscall_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> SyscallResult {
+    let oldp = match user_read_path(old_ptr, old_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let newp = match user_read_path(new_ptr, new_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let oldr = resolve_path(oldp); let oldl = resolved_len(&oldr);
+    let newr = resolve_path(newp); let newl = resolved_len(&newr);
+    let idx = match find_fs(&oldr, oldl) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    if let Some(nidx) = find_fs(&newr, newl) { with_fs(|fs| fs[nidx] = FsFile::empty()); }
+    with_fs(|fs| { let nlm = core::cmp::min(newl,64); fs[idx].name = [0;64]; fs[idx].name[..nlm].copy_from_slice(&newr[..nlm]); fs[idx].name_len = nlm; });
+    SyscallResult::success(0)
+}
+
+fn syscall_truncate_handle(handle: u64, length: u64) -> SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    let fi = unsafe { OPEN_FILES[slot].fs_index };
+    if fi >= MAX_FS_FILES { return syscall_error(syscall::EBADF); }
+    with_fs(|fs| {
+        if !fs[fi].used || fs[fi].is_dir { return syscall_error(syscall::EINVAL); }
+        let new_len = core::cmp::min(length as usize, MAX_FILE_SIZE);
+        if new_len < fs[fi].size { for b in &mut fs[fi].data[new_len..fs[fi].size] { *b = 0; } }
+        fs[fi].size = new_len;
+        unsafe { if OPEN_FILES[slot].offset > new_len { OPEN_FILES[slot].offset = new_len; } }
+        SyscallResult::success(0)
+    })
+}
+
+fn syscall_dup(handle: u64) -> SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    let src = unsafe { OPEN_FILES[slot] };
+    for i in 0..MAX_OPEN_FILES { unsafe { if !OPEN_FILES[i].used { OPEN_FILES[i] = src; return SyscallResult::success(make_handle(HANDLE_KIND_FILE, i as u32)); } } }
+    syscall_error(syscall::ENOSPC)
+}
+
+fn syscall_dup2(old_handle: u64, new_handle: u64) -> SyscallResult {
+    let Some(src_slot) = file_handle_slot(old_handle) else { return syscall_error(syscall::EBADF); };
+    let Some(dst_slot) = file_handle_slot(new_handle) else { return syscall_error(syscall::EBADF); };
+    if src_slot == dst_slot { return SyscallResult::success(new_handle); }
+    unsafe { OPEN_FILES[dst_slot] = OPEN_FILES[src_slot]; }
+    SyscallResult::success(new_handle)
+}
+
+fn syscall_access(path_ptr: u64, path_len: u64, _mode: u64) -> SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    if rlen == 1 && resolved[0] == b'/' { return SyscallResult::success(0); }
+    match find_fs(&resolved, rlen) { Some(_) => SyscallResult::success(0), None => syscall_error(syscall::ENOENT) }
+}
+
+fn syscall_fcntl(handle: u64, cmd: u64, arg: u64) -> SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    match cmd as u32 {
+        syscall::FCNTL_GETFL => SyscallResult::success(unsafe { OPEN_FILES[slot].flags as u64 }),
+        syscall::FCNTL_SETFL => { unsafe { OPEN_FILES[slot].flags = arg as u32; } SyscallResult::success(0) }
+        _ => syscall_error(syscall::ENOTSUP),
+    }
+}
+
+fn syscall_ioctl(handle: u64, request: u64, _arg: u64) -> SyscallResult {
+    let Some(_slot) = file_handle_slot(handle).or_else(|| { if handle_kind(handle) != 0 { Some(handle_slot(handle)) } else { None } }) else { return syscall_error(syscall::EBADF); };
+    if request == 0 { return SyscallResult::success(0); }
+    syscall_error(syscall::ENOTSUP)
+}
+
+fn syscall_getrandom(buf: u64, len: u64) -> SyscallResult {
+    if len == 0 { return SyscallResult::success(0); }
+    if let Err(e) = validate_user_buffer(buf, len, true) { return syscall_error(e); }
+    let n = core::cmp::min(len as usize, 4096);
+    for i in 0..n {
+        unsafe {
+            let mut x = RNG_STATE ^ read_tsc().wrapping_add(i as u64);
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            RNG_STATE = x;
+            *((buf as *mut u8).add(i)) = (x & 0xff) as u8;
+        }
+    }
+    SyscallResult::success(n as u64)
+}
+
+fn syscall_get_ticks() -> SyscallResult { SyscallResult::success(unsafe { read_tsc() }) }
+
+fn syscall_nanosleep(seconds: u64, nanoseconds: u64) -> SyscallResult {
+    let total_ns = seconds.saturating_mul(1_000_000_000).saturating_add(nanoseconds);
+    let ticks = total_ns; // nominal 1GHz TSC: 1ns ~ 1 tick
+    let start = unsafe { read_tsc() };
+    while unsafe { read_tsc().wrapping_sub(start) } < ticks { unsafe { core::arch::asm!("pause"); } }
+    SyscallResult::success(0)
+}
+
+fn syscall_mprotect(addr: u64, len: u64, _prot: u64) -> SyscallResult {
+    if len == 0 { return syscall_error(syscall::EINVAL); }
+    if let Err(e) = validate_user_buffer(addr, len, false) { return syscall_error(e); }
+    SyscallResult::success(0)
+}
+
+fn syscall_get_process_info(pid: u64, info_ptr: u64) -> SyscallResult {
+    if info_ptr == 0 { return syscall_error(syscall::EINVAL); }
+    if let Err(e) = validate_user_buffer(info_ptr, core::mem::size_of::<syscall::ProcessInfo>() as u64, true) { return syscall_error(e); }
+    let mut info = syscall::ProcessInfo { pid: pid as u32, ppid: 1, state: 0, name_len: 0, name: [0; 32] };
+    if pid == 1 {
+        let name = b"alphaos-kernel";
+        info.name_len = name.len() as u8;
+        info.name[..name.len()].copy_from_slice(name);
+        info.state = 1;
+    } else {
+        let mut found = false;
+        for i in 0..MAX_SPAWNED { unsafe {
+            if SPAWNED[i].used && SPAWNED[i].pid == pid {
+                info.state = if SPAWNED[i].exited { 2 } else { 1 };
+                info.ppid = 1;
+                let nl = PROC_NAME_LENS[i];
+                info.name_len = nl as u8;
+                info.name[..nl].copy_from_slice(&PROC_NAMES[i][..nl]);
+                found = true; break;
+            }
+        }}
+        if !found { return syscall_error(syscall::ESRCH); }
+    }
+    unsafe { core::ptr::write(info_ptr as *mut syscall::ProcessInfo, info); }
+    SyscallResult::success(0)
+}
+
+fn syscall_kill_process(pid: u64, _signal: u64) -> SyscallResult {
+    if pid == 0 { return syscall_error(syscall::EINVAL); }
+    if pid == 1 { return syscall_error(syscall::EPERM); }
+    for i in 0..MAX_SPAWNED { unsafe {
+        if SPAWNED[i].used && SPAWNED[i].pid == pid { SPAWNED[i].exited = true; SPAWNED[i].exit_code = 128; return SyscallResult::success(0); }
+    }}
+    syscall_error(syscall::ESRCH)
+}
+
+fn syscall_get_arg_count() -> SyscallResult { SyscallResult::success(0) }
+
+fn syscall_get_arg(_index: u64, buf: u64, _len: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(buf, 1, true) { return syscall_error(e); }
+    unsafe { *(buf as *mut u8) = 0; }
+    syscall_error(syscall::ENOENT)
+}
+
+fn syscall_get_env(key_ptr: u64, key_len: u64, buf_ptr: u64, buf_len: u64) -> SyscallResult {
+    let key = match user_read_bytes(key_ptr, key_len) { Ok(k)=>k, Err(e)=>return syscall_error(e) };
+    if buf_len == 0 { return syscall_error(syscall::EINVAL); }
+    for i in 0..MAX_ENV_VARS { unsafe {
+        let ev = &ENV_VARS[i];
+        if ev.used && ev.key_len == key.len() && &ev.key[..ev.key_len] == key {
+            let n = core::cmp::min(ev.val_len, (buf_len as usize).saturating_sub(1));
+            if let Err(e) = validate_user_buffer(buf_ptr, buf_len, true) { return syscall_error(e); }
+            core::ptr::copy_nonoverlapping(ev.val.as_ptr(), buf_ptr as *mut u8, n);
+            *((buf_ptr as *mut u8).add(n)) = 0;
+            return SyscallResult::success(n as u64);
+        }
+    }}
+    syscall_error(syscall::ENOENT)
+}
+
+fn syscall_set_env(key_ptr: u64, key_len: u64, val_ptr: u64, val_len: u64) -> SyscallResult {
+    let key = match user_read_bytes(key_ptr, key_len) { Ok(k)=>k, Err(e)=>return syscall_error(e) };
+    let val = match user_read_bytes(val_ptr, val_len) { Ok(v)=>v, Err(e)=>return syscall_error(e) };
+    if key.is_empty() || key.len() > MAX_ENV_KEY || val.len() > MAX_ENV_VAL { return syscall_error(syscall::EINVAL); }
+    for i in 0..MAX_ENV_VARS { unsafe {
+        let ev = &mut ENV_VARS[i];
+        if ev.used && ev.key_len == key.len() && &ev.key[..ev.key_len] == key {
+            ev.val = [0; MAX_ENV_VAL]; ev.val_len = val.len(); ev.val[..val.len()].copy_from_slice(val); return SyscallResult::success(0);
+        }
+    }}
+    for i in 0..MAX_ENV_VARS { unsafe {
+        let ev = &mut ENV_VARS[i];
+        if !ev.used {
+            *ev = EnvVar::empty(); ev.used = true; ev.key_len = key.len(); ev.val_len = val.len();
+            ev.key[..key.len()].copy_from_slice(key); ev.val[..val.len()].copy_from_slice(val);
+            return SyscallResult::success(0);
+        }
+    }}
+    syscall_error(syscall::ENOSPC)
+}
+
+fn syscall_statfs(_path_ptr: u64, info_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(info_ptr, core::mem::size_of::<syscall::StatFsInfo>() as u64, true) { return syscall_error(e); }
+    let mut used = 0u32;
+    for i in 0..MAX_FS_FILES { unsafe { if FS_FILES[i].used { used += 1; } } }
+    let info = syscall::StatFsInfo { total_blocks: MAX_FS_FILES as u64, free_blocks: (MAX_FS_FILES as u32 - used) as u64, block_size: MAX_FILE_SIZE as u64, total_files: MAX_FS_FILES as u32, free_files: MAX_FS_FILES as u32 - used };
+    unsafe { core::ptr::write(info_ptr as *mut syscall::StatFsInfo, info); }
+    SyscallResult::success(0)
+}
+
+fn syscall_fsync(_handle: u64) -> SyscallResult { SyscallResult::success(0) }
+
+fn syscall_poll(fds_ptr: u64, fds_len: u64, _timeout_ms: u64) -> SyscallResult {
+    if fds_len == 0 { return SyscallResult::success(0); }
+    let sz = core::mem::size_of::<syscall::PollFd>() as u64;
+    let total = sz.saturating_mul(fds_len);
+    if let Err(e) = validate_user_buffer(fds_ptr, total, true) { return syscall_error(e); }
+    let mut ready = 0u64;
+    for i in 0..fds_len as usize {
+        let p = (fds_ptr as usize + i * core::mem::size_of::<syscall::PollFd>()) as *mut syscall::PollFd;
+        let mut fd = unsafe { core::ptr::read(p) };
+        fd.revents = 0;
+        let h = fd.handle as usize;
+        if h > 0 && h <= MAX_OPEN_FILES { unsafe { if OPEN_FILES[h-1].used { fd.revents = fd.events & (syscall::POLLIN | syscall::POLLOUT); } else { fd.revents = syscall::POLLERR; } } } else { fd.revents = syscall::POLLERR; }
+        if fd.revents != 0 { ready += 1; }
+        unsafe { core::ptr::write(p, fd); }
+    }
+    SyscallResult::success(ready)
+}
+
+fn syscall_pipe2(pipe_ptr: u64, _flags: u64) -> SyscallResult { pipe_create(pipe_ptr) }
+
+fn syscall_socket_shutdown(handle: u64, _how: u64) -> SyscallResult {
+    if handle_kind(handle) != HANDLE_KIND_SOCKET { return syscall_error(syscall::EBADF); }
+    let slot = handle_slot(handle);
+    if slot >= MAX_SOCKETS { return syscall_error(syscall::EBADF); }
+    let used = unsafe { SOCKETS[slot].used };
+    if !used { return syscall_error(syscall::EBADF); }
+    SyscallResult::success(0)
+}
+
+fn syscall_socketpair(_domain: u64, _stype: u64, pair_ptr: u64) -> SyscallResult {
+    let mut p = [0u64; 2];
+    let r = pipe_create(p.as_mut_ptr() as u64);
+    if r.error != 0 { return r; }
+    if let Err(e) = validate_user_buffer(pair_ptr, 16, true) { return syscall_error(e); }
+    unsafe { core::ptr::write(pair_ptr as *mut u64, p[0]); core::ptr::write((pair_ptr as *mut u64).add(1), p[1]); }
+    SyscallResult::success(0)
+}
+
+fn syscall_get_rlimit(resource: u64, ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(ptr, core::mem::size_of::<syscall::ResourceLimit>() as u64, true) { return syscall_error(e); }
+    let lim = match resource as u32 {
+        syscall::RLIMIT_OPEN_FILES => syscall::ResourceLimit { current: MAX_OPEN_FILES as u64, maximum: MAX_OPEN_FILES as u64 },
+        syscall::RLIMIT_HEAP => syscall::ResourceLimit { current: 1024*1024, maximum: 1024*1024 },
+        syscall::RLIMIT_PROCS => syscall::ResourceLimit { current: MAX_SPAWNED as u64, maximum: MAX_SPAWNED as u64 },
+        _ => return syscall_error(syscall::EINVAL),
+    };
+    unsafe { core::ptr::write(ptr as *mut syscall::ResourceLimit, lim); }
+    SyscallResult::success(0)
+}
+
+fn syscall_set_rlimit(_resource: u64, _ptr: u64) -> SyscallResult { SyscallResult::success(0) }
+
+fn syscall_get_system_name(buf: u64, len: u64) -> SyscallResult {
+    let n = unsafe { SYS_NAME_LEN };
+    if len == 0 { return syscall_error(syscall::EINVAL); }
+    let copy_n = core::cmp::min(n, (len as usize).saturating_sub(1));
+    if let Err(e) = validate_user_buffer(buf, len, true) { return syscall_error(e); }
+    unsafe { core::ptr::copy_nonoverlapping(core::ptr::addr_of!(SYS_NAME).cast::<u8>(), buf as *mut u8, copy_n); *((buf as *mut u8).add(copy_n)) = 0; }
+    SyscallResult::success(copy_n as u64)
+}
+
+fn syscall_set_system_name(name_ptr: u64, name_len: u64) -> SyscallResult {
+    let name = match user_read_bytes(name_ptr, name_len) { Ok(n)=>n, Err(e)=>return syscall_error(e) };
+    if name.is_empty() || name.len() > 32 { return syscall_error(syscall::EINVAL); }
+    unsafe { SYS_NAME = [0;32]; SYS_NAME[..name.len()].copy_from_slice(name); SYS_NAME_LEN = name.len(); }
+    SyscallResult::success(0)
+}
+
+fn syscall_create_timer(interval_ms: u64, _flags: u64) -> SyscallResult {
+    for i in 0..MAX_TIMERS { unsafe {
+        if !TIMERS[i].used { TIMERS[i] = TimerSlot { used: true, interval_ms, start_tick: read_tsc() }; return SyscallResult::success((i+1) as u64); }
+    }}
+    syscall_error(syscall::ENOSPC)
+}
+
+fn syscall_get_timer(timer_id: u64) -> SyscallResult {
+    if timer_id == 0 || (timer_id as usize) > MAX_TIMERS { return syscall_error(syscall::EINVAL); }
+    let t = unsafe { &TIMERS[timer_id as usize - 1] };
+    if !t.used { return syscall_error(syscall::EINVAL); }
+    let elapsed_ms = unsafe { read_tsc().wrapping_sub(t.start_tick) / 1_000_000 };
+    let rem = if elapsed_ms >= t.interval_ms { 0 } else { t.interval_ms - elapsed_ms };
+    SyscallResult::success(rem)
+}
+
+fn syscall_cancel_timer(timer_id: u64) -> SyscallResult {
+    if timer_id == 0 || (timer_id as usize) > MAX_TIMERS { return syscall_error(syscall::EINVAL); }
+    unsafe { if !TIMERS[timer_id as usize - 1].used { return syscall_error(syscall::EINVAL); } TIMERS[timer_id as usize - 1] = TimerSlot::empty(); }
+    SyscallResult::success(0)
+}
+
+fn syscall_create_event(_flags: u64) -> SyscallResult {
+    for i in 0..MAX_EVENTS { unsafe { if !EVENTS[i].used { EVENTS[i] = EventSlot { used: true, signaled: false }; return SyscallResult::success((i+1) as u64); } } }
+    syscall_error(syscall::ENOSPC)
+}
+
+fn syscall_signal_event(event_id: u64) -> SyscallResult {
+    if event_id == 0 || (event_id as usize) > MAX_EVENTS { return syscall_error(syscall::EINVAL); }
+    unsafe { if !EVENTS[event_id as usize - 1].used { return syscall_error(syscall::EINVAL); } EVENTS[event_id as usize - 1].signaled = true; }
+    SyscallResult::success(0)
+}
+
+fn syscall_wait_event(event_id: u64, timeout_ms: u64) -> SyscallResult {
+    if event_id == 0 || (event_id as usize) > MAX_EVENTS { return syscall_error(syscall::EINVAL); }
+    let start = unsafe { read_tsc() };
+    let timeout_ticks = timeout_ms.saturating_mul(1_000_000);
+    loop {
+        unsafe {
+            if !EVENTS[event_id as usize - 1].used { return syscall_error(syscall::EINVAL); }
+            if EVENTS[event_id as usize - 1].signaled { EVENTS[event_id as usize - 1].signaled = false; return SyscallResult::success(0); }
+            if timeout_ms != 0 && read_tsc().wrapping_sub(start) >= timeout_ticks { return syscall_error(syscall::EAGAIN); }
+            core::arch::asm!("pause");
+        }
+    }
+}
+
+fn syscall_get_memory_info(ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(ptr, core::mem::size_of::<syscall::MemoryInfo>() as u64, true) { return syscall_error(e); }
+    let total = unsafe { ALLOCATOR_END.saturating_sub(ALLOCATOR_START) };
+    let used = unsafe { ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START) };
+    let info = syscall::MemoryInfo { managed_bytes: total, allocated_bytes: used, available_bytes: total.saturating_sub(used) };
+    unsafe { core::ptr::write(ptr as *mut syscall::MemoryInfo, info); }
+    SyscallResult::success(0)
+}
+
+fn syscall_debug_log(msg_ptr: u64, msg_len: u64) -> SyscallResult {
+    let msg = match user_read_bytes(msg_ptr, msg_len) { Ok(m)=>m, Err(e)=>return syscall_error(e) };
+    // Kernel log only in freestanding console; serial not wired in this build.
+    unsafe {
+        for &b in msg.iter().take(KLOG_SIZE) { let idx = KLOG_LEN % KLOG_SIZE; KLOG[idx] = b; KLOG_LEN = KLOG_LEN.saturating_add(1); }
+        let idx = KLOG_LEN % KLOG_SIZE; KLOG[idx] = b'\n'; KLOG_LEN = KLOG_LEN.saturating_add(1);
+    }
+    SyscallResult::success(msg.len() as u64)
+}
+
+fn syscall_get_console_size(ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(ptr, core::mem::size_of::<syscall::ConsoleSize>() as u64, true) { return syscall_error(e); }
+    let info = syscall::ConsoleSize { columns: 80, rows: 25 };
+    unsafe { core::ptr::write(ptr as *mut syscall::ConsoleSize, info); }
+    SyscallResult::success(0)
+}
+
+fn syscall_set_console_mode(mode: u64) -> SyscallResult { unsafe { CONSOLE_MODE = mode; } SyscallResult::success(0) }
+
+fn syscall_get_boot_info(ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(ptr, core::mem::size_of::<syscall::BootInfo>() as u64, true) { return syscall_error(e); }
+    let uptime = unsafe { read_tsc().wrapping_sub(BOOT_TSC) / 1_000_000 };
+    let info = syscall::BootInfo { uptime_ms: uptime, syscall_count: syscall::SYSCALL_COUNT as u32, abi_major: syscall::SYSCALL_ABI_MAJOR, abi_minor: syscall::SYSCALL_ABI_MINOR };
+    unsafe { core::ptr::write(ptr as *mut syscall::BootInfo, info); }
+    SyscallResult::success(0)
+}
+
+fn syscall_get_kernel_log(buf: u64, len: u64) -> SyscallResult {
+    if len == 0 { return SyscallResult::success(0); }
+    if let Err(e) = validate_user_buffer(buf, len, true) { return syscall_error(e); }
+    let total = unsafe { core::cmp::min(KLOG_LEN, KLOG_SIZE) };
+    let copy_n = core::cmp::min(total, (len as usize).saturating_sub(1));
+    unsafe {
+        let start = if KLOG_LEN > KLOG_SIZE { KLOG_LEN % KLOG_SIZE } else { 0 };
+        for i in 0..copy_n { let idx = (start + i) % KLOG_SIZE; *((buf as *mut u8).add(i)) = KLOG[idx]; }
+        *((buf as *mut u8).add(copy_n)) = 0;
+    }
+    SyscallResult::success(copy_n as u64)
+}
+
+fn syscall_set_thread_name(tid: u64, name_ptr: u64, name_len: u64) -> SyscallResult {
+    let name = match user_read_bytes(name_ptr, name_len) { Ok(n)=>n, Err(e)=>return syscall_error(e) };
+    let n = core::cmp::min(name.len(), MAX_PROC_NAME);
+    for i in 0..MAX_SPAWNED { unsafe {
+        if SPAWNED[i].used && SPAWNED[i].pid == tid {
+            PROC_NAMES[i] = [0; MAX_PROC_NAME]; PROC_NAMES[i][..n].copy_from_slice(&name[..n]); PROC_NAME_LENS[i] = n;
+            return SyscallResult::success(0);
+        }
+    }}
+    if tid == 1 { return SyscallResult::success(0); }
+    syscall_error(syscall::ESRCH)
+}
+
+fn syscall_get_thread_name(tid: u64, buf_ptr: u64, buf_len: u64) -> SyscallResult {
+    if buf_len == 0 { return syscall_error(syscall::EINVAL); }
+    let mut found: Option<([u8;MAX_PROC_NAME], usize)> = None;
+    if tid == 1 { let n=b"alphaos-kernel"; let mut b=[0u8;MAX_PROC_NAME]; b[..n.len()].copy_from_slice(n); found=Some((b,n.len())); }
+    for i in 0..MAX_SPAWNED { unsafe { if SPAWNED[i].used && SPAWNED[i].pid == tid { found = Some((PROC_NAMES[i], PROC_NAME_LENS[i])); break; } } }
+    let (name, nlen) = match found { Some(v)=>v, None=>return syscall_error(syscall::ESRCH) };
+    let copy_n = core::cmp::min(nlen, (buf_len as usize).saturating_sub(1));
+    if let Err(e) = validate_user_buffer(buf_ptr, buf_len, true) { return syscall_error(e); }
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf_ptr as *mut u8, copy_n); *((buf_ptr as *mut u8).add(copy_n)) = 0; }
+    SyscallResult::success(copy_n as u64)
+}
+
+fn syscall_get_cpu_count() -> SyscallResult { SyscallResult::success(1) }
+fn syscall_get_uptime_ms() -> SyscallResult { SyscallResult::success(unsafe { read_tsc().wrapping_sub(BOOT_TSC) / 1_000_000 }) }
+
+fn syscall_list_processes(buf_ptr: u64, buf_len: u64) -> SyscallResult {
+    let max = (buf_len as usize) / 4;
+    if max == 0 { return SyscallResult::success(0); }
+    if let Err(e) = validate_user_buffer(buf_ptr, (max*4) as u64, true) { return syscall_error(e); }
+    let mut count = 0usize;
+    unsafe { if count < max { *((buf_ptr as *mut u32).add(count)) = 1; count+=1; } }
+    for i in 0..MAX_SPAWNED { unsafe {
+        if SPAWNED[i].used && !SPAWNED[i].exited && count < max { *((buf_ptr as *mut u32).add(count)) = SPAWNED[i].pid as u32; count+=1; }
+    }}
+    SyscallResult::success(count as u64)
+}
+
+fn syscall_get_proc_name(pid: u64, buf_ptr: u64, buf_len: u64) -> SyscallResult { syscall_get_thread_name(pid, buf_ptr, buf_len) }
+
+
+fn sys_stat_handle(handle: u64, stat_ptr: u64) -> syscall::SyscallResult {
+    let Some(slot)=file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    let fi = unsafe { OPEN_FILES[slot].fs_index };
+    let (size,is_dir) = with_fs(|fs| if fi>=MAX_FS_FILES || !fs[fi].used { (0u64,false) } else { (fs[fi].size as u64, fs[fi].is_dir) });
+    let st = syscall::FileStat { size, mode: if is_dir { 0o040755 } else { 0o100644 }, flags: 0 };
+    let bytes = unsafe { core::slice::from_raw_parts((&st as *const syscall::FileStat).cast::<u8>(), core::mem::size_of::<syscall::FileStat>()) };
+    match sc_copy_to_user(stat_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>syscall_error(e) }
+}
+
+fn syscall_getppid() -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_gettid() -> syscall::SyscallResult { syscall::SyscallResult::success(1) }
+fn syscall_sched_yield() -> syscall::SyscallResult { unsafe { core::arch::asm!("pause"); } syscall::SyscallResult::success(0) }
+fn syscall_set_process_name(name_ptr: u64, name_len: u64) -> syscall::SyscallResult {
+    let name = match sc_read_user(name_ptr, name_len) { Ok(s)=>s, Err(e)=>{sc_set_last_error(e); return syscall_error(e);} };
+    let n = core::cmp::min(name.len(), 31);
+    unsafe {
+        let dst = core::ptr::addr_of_mut!(PROC_NAMES).cast::<[u8;32]>().add(0);
+        core::ptr::write_bytes((*dst).as_mut_ptr(), 0, 32);
+        core::ptr::copy_nonoverlapping(name.as_ptr(), (*dst).as_mut_ptr(), n);
+    }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_get_process_name2(pid: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    if buf_len==0 { return syscall::SyscallResult::success(0); }
+    let idx = if pid==0 || pid==1 { 0usize } else { (pid as usize).saturating_sub(2) };
+    if idx >= 32 { sc_set_last_error(syscall::ESRCH); return syscall_error(syscall::ESRCH); }
+    let mut tmp=[0u8;32]; let mut n=0usize;
+    unsafe {
+        let src = core::ptr::addr_of!(PROC_NAMES).cast::<[u8;32]>().add(idx);
+        for i in 0..32 { let b=(*src)[i]; if b==0 {break;} tmp[i]=b; n+=1; }
+    }
+    if n==0 { let d=b"alphaos"; tmp[..d.len()].copy_from_slice(d); n=d.len(); }
+    match sc_copy_cstr_to_user(buf_ptr, buf_len, &tmp[..n]) { Ok(v)=>syscall::SyscallResult::success(v), Err(e)=>{sc_set_last_error(e); syscall_error(e)} }
+}
+fn syscall_fork() -> syscall::SyscallResult { sc_set_last_error(syscall::ENOTSUP); syscall_error(syscall::ENOTSUP) }
+fn syscall_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, flags: u64) -> syscall::SyscallResult {
+    // freestanding single-process model: exec behaves as spawn+immediate success; stores name
+    let r = sys_spawn(path_ptr, path_len, argv_ptr, flags);
+    r
+}
+fn syscall_waitpid(pid: u64, status_ptr: u64, options: u64) -> syscall::SyscallResult { sys_wait(pid, status_ptr, options) }
+fn syscall_get_exit_code(pid: u64) -> syscall::SyscallResult {
+    for i in 0..MAX_SPAWNED { unsafe {
+        if SPAWNED[i].used && SPAWNED[i].pid as u64 == pid {
+            if SPAWNED[i].exited { return syscall::SyscallResult::success(SPAWNED[i].exit_code as u64); }
+            return syscall_error(syscall::EAGAIN);
+        }
+    }}
+    sc_set_last_error(syscall::ESRCH); syscall_error(syscall::ESRCH)
+}
+fn syscall_set_thread_priority(tid: u64, priority: u64) -> syscall::SyscallResult {
+    let idx = (tid as usize).min(31);
+    unsafe { *core::ptr::addr_of_mut!(SC_THREAD_PRIORITY).cast::<i32>().add(idx) = priority as i32; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_get_thread_priority(tid: u64) -> syscall::SyscallResult {
+    let idx = (tid as usize).min(31);
+    let p = unsafe { *core::ptr::addr_of!(SC_THREAD_PRIORITY).cast::<i32>().add(idx) };
+    syscall::SyscallResult::success(p as u64)
+}
+fn syscall_process_exists(pid: u64) -> syscall::SyscallResult {
+    if pid==0 || pid==1 { return syscall::SyscallResult::success(1); }
+    for i in 0..MAX_SPAWNED { unsafe { if SPAWNED[i].used && SPAWNED[i].pid as u64 == pid { return syscall::SyscallResult::success(1); } } }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_get_process_list(buf_ptr: u64, max_entries: u64) -> syscall::SyscallResult { syscall_list_processes(buf_ptr, max_entries.saturating_mul(4)) }
+fn syscall_kill_thread(tid: u64) -> syscall::SyscallResult { syscall_kill_process(tid, 9) }
+fn syscall_get_current_tid() -> syscall::SyscallResult { syscall::SyscallResult::success(1) }
+fn syscall_set_uid(uid: u64) -> syscall::SyscallResult { unsafe { *core::ptr::addr_of_mut!(SC_UID)=uid as u32; } syscall::SyscallResult::success(0) }
+fn syscall_get_uid() -> syscall::SyscallResult { syscall::SyscallResult::success(unsafe { *core::ptr::addr_of!(SC_UID) } as u64) }
+fn syscall_set_gid(gid: u64) -> syscall::SyscallResult { unsafe { *core::ptr::addr_of_mut!(SC_GID)=gid as u32; } syscall::SyscallResult::success(0) }
+fn syscall_get_gid() -> syscall::SyscallResult { syscall::SyscallResult::success(unsafe { *core::ptr::addr_of!(SC_GID) } as u64) }
+fn syscall_get_process_times(_pid: u64, buf_ptr: u64) -> syscall::SyscallResult {
+    #[repr(C)] struct T { uptime_ms: u64, user_ms: u64, sys_ms: u64, ticks: u64 }
+    let t = T { uptime_ms: sc_ticks_ms(), user_ms: sc_ticks_ms(), sys_ms: 0, ticks: unsafe{read_tsc()} };
+    let bytes = unsafe { core::slice::from_raw_parts((&t as *const T).cast::<u8>(), core::mem::size_of::<T>()) };
+    match sc_copy_to_user(buf_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>{sc_set_last_error(e); syscall_error(e)} }
+}
+fn syscall_openat(_dir_handle: u64, path_ptr: u64, path_len: u64, flags: u64) -> syscall::SyscallResult { sys_open(path_ptr, path_len, flags, 0) }
+fn syscall_readat(handle: u64, offset: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some(slot)=file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    let old = unsafe { OPEN_FILES[slot].offset };
+    unsafe { OPEN_FILES[slot].offset = offset as usize; }
+    let r = sys_file_read(handle, buffer, length);
+    unsafe { OPEN_FILES[slot].offset = old; }
+    r
+}
+fn syscall_writeat(handle: u64, offset: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some(slot)=file_handle_slot(handle) else { return syscall_error(syscall::EBADF); };
+    let old = unsafe { OPEN_FILES[slot].offset };
+    unsafe { OPEN_FILES[slot].offset = offset as usize; }
+    let r = sys_file_write(handle, buffer, length);
+    unsafe { OPEN_FILES[slot].offset = old; }
+    r
+}
+fn syscall_file_truncate_path(path_ptr: u64, path_len: u64, length: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    let idx = match find_fs(&resolved, rlen) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    with_fs(|fs| {
+        if fs[idx].is_dir { return syscall_error(syscall::EINVAL); }
+        let new_len = core::cmp::min(length as usize, MAX_FILE_SIZE);
+        if new_len < fs[idx].size { for b in &mut fs[idx].data[new_len..fs[idx].size] { *b=0; } }
+        fs[idx].size = new_len;
+        syscall::SyscallResult::success(0)
+    })
+}
+fn syscall_file_stat_path(path_ptr: u64, path_len: u64, stat_ptr: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    let idx = match find_fs(&resolved, rlen) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    let (size,is_dir) = with_fs(|fs| (fs[idx].size as u64, fs[idx].is_dir));
+    let st = syscall::FileStat { size, mode: if is_dir { 0o040755 } else { 0o100644 }, flags: 0 };
+    let bytes = unsafe { core::slice::from_raw_parts((&st as *const syscall::FileStat).cast::<u8>(), core::mem::size_of::<syscall::FileStat>()) };
+    match sc_copy_to_user(stat_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>syscall_error(e) }
+}
+fn syscall_symlink(target_ptr: u64, target_len: u64, link_ptr: u64, link_len: u64) -> syscall::SyscallResult {
+    let target = match sc_read_user(target_ptr, target_len) { Ok(s)=>s, Err(e)=>return syscall_error(e) };
+    let linkp = match user_read_path(link_ptr, link_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(linkp); let rlen = resolved_len(&resolved);
+    for i in 0..32 { unsafe {
+        if !*core::ptr::addr_of!(SC_SYMLINK_USED).cast::<bool>().add(i) {
+            *core::ptr::addr_of_mut!(SC_SYMLINK_USED).cast::<bool>().add(i)=true;
+            let ln=core::cmp::min(rlen,128); let tn=core::cmp::min(target.len(),128);
+            let dst=core::ptr::addr_of_mut!(SC_SYMLINKS).cast::<[u8;128]>().add(i);
+            let tdst=core::ptr::addr_of_mut!(SC_SYMLINK_TARGETS).cast::<[u8;128]>().add(i);
+            core::ptr::write_bytes((*dst).as_mut_ptr(),0,128); core::ptr::write_bytes((*tdst).as_mut_ptr(),0,128);
+            core::ptr::copy_nonoverlapping(resolved.as_ptr(), (*dst).as_mut_ptr(), ln);
+            core::ptr::copy_nonoverlapping(target.as_ptr(), (*tdst).as_mut_ptr(), tn);
+            *core::ptr::addr_of_mut!(SC_SYMLINK_LEN).cast::<usize>().add(i)=ln;
+            *core::ptr::addr_of_mut!(SC_SYMLINK_TLEN).cast::<usize>().add(i)=tn;
+            return syscall::SyscallResult::success(0);
+        }
+    }}
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_readlink(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen = resolved_len(&resolved);
+    for i in 0..32 { unsafe {
+        if *core::ptr::addr_of!(SC_SYMLINK_USED).cast::<bool>().add(i) {
+            let ln=*core::ptr::addr_of!(SC_SYMLINK_LEN).cast::<usize>().add(i);
+            let src=core::ptr::addr_of!(SC_SYMLINKS).cast::<[u8;128]>().add(i);
+            if ln==rlen && (&(*src))[..ln]==resolved[..rlen] {
+                let tn=*core::ptr::addr_of!(SC_SYMLINK_TLEN).cast::<usize>().add(i);
+                let ts=core::ptr::addr_of!(SC_SYMLINK_TARGETS).cast::<[u8;128]>().add(i);
+                let slice=core::slice::from_raw_parts((*ts).as_ptr(), tn);
+                return match sc_copy_to_user(buf_ptr, buf_len, slice) { Ok(n)=>syscall::SyscallResult::success(n), Err(e)=>syscall_error(e) };
+            }
+        }
+    }}
+    syscall_error(syscall::ENOENT)
+}
+fn syscall_link(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> syscall::SyscallResult {
+    // simple copy-as-link in ramfs
+    let oldp = match user_read_path(old_ptr, old_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let newp = match user_read_path(new_ptr, new_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let oldr = resolve_path(oldp); let oldl=resolved_len(&oldr);
+    let newr = resolve_path(newp); let newl=resolved_len(&newr);
+    let src_idx = match find_fs(&oldr, oldl) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    if find_fs(&newr, newl).is_some() { return syscall_error(syscall::EEXIST); }
+    with_fs(|fs| {
+        if fs[src_idx].is_dir { return syscall_error(syscall::EINVAL); }
+        for i in 0..MAX_FS_FILES { if !fs[i].used {
+            fs[i]=fs[src_idx];
+            let nlm=core::cmp::min(newl,64);
+            fs[i].name=[0;64]; fs[i].name[..nlm].copy_from_slice(&newr[..nlm]); fs[i].name_len=nlm;
+            return syscall::SyscallResult::success(0);
+        }}
+        syscall_error(syscall::ENOSPC)
+    })
+}
+fn syscall_chmod(path_ptr: u64, path_len: u64, mode: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen=resolved_len(&resolved);
+    let idx = match find_fs(&resolved, rlen) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    unsafe { *core::ptr::addr_of_mut!(SC_FILE_MODE).cast::<u32>().add(idx.min(127)) = mode as u32; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_chown(path_ptr: u64, path_len: u64, _uid: u64, _gid: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen=resolved_len(&resolved);
+    if find_fs(&resolved, rlen).is_none() { return syscall_error(syscall::ENOENT); }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_lseek64(handle: u64, offset: u64, whence: u64) -> syscall::SyscallResult { sys_seek(handle, offset, whence) }
+fn syscall_fstat2(handle: u64, stat_ptr: u64) -> syscall::SyscallResult { sys_stat_handle(handle, stat_ptr) }
+fn syscall_isatty(handle: u64) -> syscall::SyscallResult {
+    if handle == 1 || handle == 0 { return syscall::SyscallResult::success(1); }
+    let _ = handle_kind(handle);
+    syscall::SyscallResult::success(0)
+}
+fn syscall_ttyname(handle: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    if syscall_isatty(handle).value != 1 { return syscall_error(syscall::ENOTSUP); }
+    match sc_copy_cstr_to_user(buf_ptr, buf_len, b"/dev/console") { Ok(n)=>syscall::SyscallResult::success(n), Err(e)=>syscall_error(e) }
+}
+fn syscall_getdents(handle: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    // iterate ramfs entries; handle ignored for simplicity, returns all entries
+    let _ = handle;
+    let max = (buf_len as usize) / core::mem::size_of::<syscall::DirEntry>();
+    if max == 0 { return syscall::SyscallResult::success(0); }
+    if let Err(e)=validate_user_buffer(buf_ptr, (max*core::mem::size_of::<syscall::DirEntry>()) as u64, true){return syscall_error(e);}
+    let mut count=0usize;
+    with_fs(|fs| {
+        for i in 0..MAX_FS_FILES {
+            if count>=max { break; }
+            if !fs[i].used { continue; }
+            let mut entry = syscall::DirEntry { name_len: fs[i].name_len as u32, entry_type: if fs[i].is_dir { 2 } else { 1 }, size: fs[i].size as u64, name:[0;64] };
+            let n = core::cmp::min(fs[i].name_len, 64);
+            entry.name[..n].copy_from_slice(&fs[i].name[..n]);
+            unsafe { core::ptr::write_unaligned((buf_ptr as *mut syscall::DirEntry).add(count), entry); }
+            count+=1;
+        }
+    });
+    syscall::SyscallResult::success(count as u64)
+}
+fn syscall_realpath(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved = resolve_path(path); let rlen=resolved_len(&resolved);
+    match sc_copy_cstr_to_user(buf_ptr, buf_len, &resolved[..rlen]) { Ok(n)=>syscall::SyscallResult::success(n), Err(e)=>syscall_error(e) }
+}
+fn syscall_copy_file(src_ptr: u64, src_len: u64, dst_ptr: u64, dst_len: u64) -> syscall::SyscallResult {
+    let srcp = match user_read_path(src_ptr, src_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let dstp = match user_read_path(dst_ptr, dst_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let srcr=resolve_path(srcp); let srcl=resolved_len(&srcr);
+    let dstr=resolve_path(dstp); let dstl=resolved_len(&dstr);
+    let src_idx = match find_fs(&srcr, srcl) { Some(i)=>i, None=>return syscall_error(syscall::ENOENT) };
+    let (is_dir,size) = with_fs(|fs| (fs[src_idx].is_dir, fs[src_idx].size));
+    if is_dir { return syscall_error(syscall::EINVAL); }
+    let mut data=[0u8; MAX_FILE_SIZE];
+    with_fs(|fs| { data[..size].copy_from_slice(&fs[src_idx].data[..size]); });
+    if let Some(di)=find_fs(&dstr,dstl) {
+        with_fs(|fs| { if fs[di].is_dir { return; } fs[di].data[..size].copy_from_slice(&data[..size]); fs[di].size=size; for b in &mut fs[di].data[size..MAX_FILE_SIZE]{*b=0;} });
+        return syscall::SyscallResult::success(size as u64);
+    }
+    with_fs(|fs| {
+        for i in 0..MAX_FS_FILES { if !fs[i].used {
+            fs[i].used=true; fs[i].is_dir=false; fs[i].size=size; let nlm=core::cmp::min(dstl,64);
+            fs[i].name=[0;64]; fs[i].name[..nlm].copy_from_slice(&dstr[..nlm]); fs[i].name_len=nlm;
+            fs[i].data[..size].copy_from_slice(&data[..size]);
+            return syscall::SyscallResult::success(size as u64);
+        }}
+        syscall_error(syscall::ENOSPC)
+    })
+}
+fn syscall_mkfifo(path_ptr: u64, path_len: u64, _mode: u64) -> syscall::SyscallResult {
+    let path = match user_read_path(path_ptr, path_len) { Ok(p)=>p, Err(e)=>return syscall_error(e) };
+    let resolved=resolve_path(path); let rlen=resolved_len(&resolved);
+    if find_fs(&resolved,rlen).is_some() { return syscall_error(syscall::EEXIST); }
+    with_fs(|fs| { for i in 0..MAX_FS_FILES { if !fs[i].used { fs[i].used=true; fs[i].is_dir=false; fs[i].size=0; let nlm=core::cmp::min(rlen,64); fs[i].name=[0;64]; fs[i].name[..nlm].copy_from_slice(&resolved[..nlm]); fs[i].name_len=nlm; return syscall::SyscallResult::success(0); }} syscall_error(syscall::ENOSPC) })
+}
+fn syscall_file_lock(_handle: u64, _operation: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_file_unlock(_handle: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+
+fn syscall_memory_map(length: u64, _prot: u64, _flags: u64) -> syscall::SyscallResult { sys_heap_alloc(length, 4096) }
+fn syscall_memory_unmap(address: u64, length: u64) -> syscall::SyscallResult { sys_heap_free(address, length) }
+fn syscall_memory_protect(address: u64, length: u64, _prot: u64) -> syscall::SyscallResult { syscall_mprotect(address, length, _prot) }
+fn syscall_memory_advise(_address: u64, _length: u64, _advice: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_memory_stats(buf_ptr: u64) -> syscall::SyscallResult { syscall_get_memory_info(buf_ptr) }
+fn syscall_heap_stats(buf_ptr: u64) -> syscall::SyscallResult { syscall_get_memory_info(buf_ptr) }
+fn syscall_page_size() -> syscall::SyscallResult { syscall::SyscallResult::success(4096) }
+fn syscall_memory_fill(dst: u64, value: u64, len: u64) -> syscall::SyscallResult {
+    if len==0 { return syscall::SyscallResult::success(0); }
+    if let Err(e)=validate_user_buffer(dst,len,true){return syscall_error(e);}
+    unsafe { core::ptr::write_bytes(dst as *mut u8, value as u8, len as usize); }
+    syscall::SyscallResult::success(len)
+}
+fn syscall_memory_compare(a: u64, b: u64, len: u64) -> syscall::SyscallResult {
+    if len==0 { return syscall::SyscallResult::success(0); }
+    if let Err(e)=validate_user_buffer(a,len,false){return syscall_error(e);}
+    if let Err(e)=validate_user_buffer(b,len,false){return syscall_error(e);}
+    let sa=unsafe{core::slice::from_raw_parts(a as *const u8,len as usize)};
+    let sb=unsafe{core::slice::from_raw_parts(b as *const u8,len as usize)};
+    for i in 0..sa.len() { if sa[i]!=sb[i] { return syscall::SyscallResult::success(if sa[i]<sb[i]{u64::MAX}else{1}); } }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_memory_copy(dst: u64, src: u64, len: u64) -> syscall::SyscallResult {
+    if len==0 { return syscall::SyscallResult::success(0); }
+    if let Err(e)=validate_user_buffer(src,len,false){return syscall_error(e);}
+    if let Err(e)=validate_user_buffer(dst,len,true){return syscall_error(e);}
+    unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, len as usize); }
+    syscall::SyscallResult::success(len)
+}
+fn syscall_clock_monotonic(out_ptr: u64) -> syscall::SyscallResult { sys_clock_gettime(syscall::CLOCK_MONOTONIC as u64, out_ptr) }
+fn syscall_clock_realtime(out_ptr: u64) -> syscall::SyscallResult { sys_clock_gettime(syscall::CLOCK_REALTIME as u64, out_ptr) }
+fn syscall_set_timer_ms(timer_id: u64, ms: u64) -> syscall::SyscallResult {
+    let idx = timer_id as usize;
+    if idx >= 64 { return syscall_error(syscall::EINVAL); }
+    let deadline = sc_ticks_ms().saturating_add(ms);
+    unsafe { *core::ptr::addr_of_mut!(TIMERS).cast::<u64>().add(idx) = deadline; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_get_timer_ms(timer_id: u64) -> syscall::SyscallResult { syscall_get_timer(timer_id) }
+fn syscall_sleep_ms(ms: u64) -> syscall::SyscallResult { sys_sleep(ms.saturating_mul(1_000_000)) }
+fn syscall_alarm(seconds: u64) -> syscall::SyscallResult { unsafe { *core::ptr::addr_of_mut!(SC_ALARM_MS)=sc_ticks_ms().saturating_add(seconds.saturating_mul(1000)); } syscall::SyscallResult::success(0) }
+fn syscall_time_now() -> syscall::SyscallResult { syscall::SyscallResult::success(sc_ticks_ms()/1000) }
+fn syscall_ticks_per_second() -> syscall::SyscallResult { syscall::SyscallResult::success(1_000_000_000) }
+fn syscall_uptime_ns() -> syscall::SyscallResult { syscall::SyscallResult::success(sc_ticks_ms().saturating_mul(1_000_000)) }
+fn syscall_deadline_wait(deadline_ms: u64) -> syscall::SyscallResult {
+    let now=sc_ticks_ms();
+    if deadline_ms>now { sys_sleep((deadline_ms-now).saturating_mul(1_000_000)); }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_create_mutex() -> syscall::SyscallResult {
+    for i in 0..64 { unsafe { let p=core::ptr::addr_of_mut!(SC_MUTEXES).cast::<u8>().add(i); if *p==0 { *p=1; return syscall::SyscallResult::success(i as u64 + 1); } } }
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_lock_mutex(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let p=unsafe{core::ptr::addr_of_mut!(SC_MUTEXES).cast::<u8>().add((handle-1) as usize)};
+    unsafe { if *p==0 { return syscall_error(syscall::EINVAL); } *p=2; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_unlock_mutex(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let p=unsafe{core::ptr::addr_of_mut!(SC_MUTEXES).cast::<u8>().add((handle-1) as usize)};
+    unsafe { if *p==0 { return syscall_error(syscall::EINVAL); } *p=1; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_destroy_mutex(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    unsafe { *core::ptr::addr_of_mut!(SC_MUTEXES).cast::<u8>().add((handle-1) as usize)=0; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_create_sem(initial: u64) -> syscall::SyscallResult {
+    for i in 0..64 { unsafe { let u=core::ptr::addr_of_mut!(SC_SEMS_USED).cast::<bool>().add(i); if !*u { *u=true; *core::ptr::addr_of_mut!(SC_SEMS).cast::<i32>().add(i)=initial as i32; return syscall::SyscallResult::success(i as u64+1); } } }
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_sem_wait(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_SEMS_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); }
+        let p=core::ptr::addr_of_mut!(SC_SEMS).cast::<i32>().add(i);
+        if *p>0 { *p-=1; syscall::SyscallResult::success(0) } else { syscall_error(syscall::EAGAIN) }
+    }
+}
+fn syscall_sem_post(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_SEMS_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); }
+        *core::ptr::addr_of_mut!(SC_SEMS).cast::<i32>().add(i)+=1; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_sem_destroy(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    unsafe { *core::ptr::addr_of_mut!(SC_SEMS_USED).cast::<bool>().add((handle-1) as usize)=false; *core::ptr::addr_of_mut!(SC_SEMS).cast::<i32>().add((handle-1) as usize)=0; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_create_condvar() -> syscall::SyscallResult {
+    for i in 0..64 { unsafe { let p=core::ptr::addr_of_mut!(SC_CONDVARS).cast::<bool>().add(i); if !*p { *p=true; return syscall::SyscallResult::success(i as u64+1); } } }
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_condvar_wait(cv_handle: u64, _mutex_handle: u64) -> syscall::SyscallResult {
+    if cv_handle==0 || cv_handle>64 { return syscall_error(syscall::EINVAL); }
+    unsafe { if !*core::ptr::addr_of!(SC_CONDVARS).cast::<bool>().add((cv_handle-1) as usize) { return syscall_error(syscall::EINVAL); } }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_condvar_signal(cv_handle: u64) -> syscall::SyscallResult {
+    if cv_handle==0 || cv_handle>64 { return syscall_error(syscall::EINVAL); }
+    unsafe { if !*core::ptr::addr_of!(SC_CONDVARS).cast::<bool>().add((cv_handle-1) as usize) { return syscall_error(syscall::EINVAL); } }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_condvar_broadcast(cv_handle: u64) -> syscall::SyscallResult { syscall_condvar_signal(cv_handle) }
+fn syscall_futex_wait(_addr: u64, _expected: u64, _timeout_ms: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_futex_wake(_addr: u64, count: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(count) }
+fn syscall_msgq_create(_capacity: u64) -> syscall::SyscallResult {
+    for i in 0..16 { unsafe { let u=core::ptr::addr_of_mut!(SC_MSGQ_USED).cast::<bool>().add(i); if !*u { *u=true; *core::ptr::addr_of_mut!(SC_MSGQ_HEAD).cast::<usize>().add(i)=0; *core::ptr::addr_of_mut!(SC_MSGQ_TAIL).cast::<usize>().add(i)=0; *core::ptr::addr_of_mut!(SC_MSGQ_COUNT).cast::<usize>().add(i)=0; return syscall::SyscallResult::success(i as u64+1); } } }
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_msgq_send(handle: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>16 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_MSGQ_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); } }
+    let count=unsafe{*core::ptr::addr_of!(SC_MSGQ_COUNT).cast::<usize>().add(i)};
+    if count>=8 { return syscall_error(syscall::ENOSPC); }
+    let src = match sc_read_user(buf_ptr, buf_len) { Ok(s)=>s, Err(e)=>return syscall_error(e) };
+    let n=core::cmp::min(src.len(),256);
+    unsafe {
+        let tail=*core::ptr::addr_of!(SC_MSGQ_TAIL).cast::<usize>().add(i);
+        let slot=core::ptr::addr_of_mut!(SC_MSGQ).cast::<[[u8;256];8]>().add(i);
+        core::ptr::write_bytes((*slot)[tail].as_mut_ptr(),0,256);
+        core::ptr::copy_nonoverlapping(src.as_ptr(), (*slot)[tail].as_mut_ptr(), n);
+        *core::ptr::addr_of_mut!(SC_MSGQ_LEN).cast::<[usize;8]>().add(i).cast::<usize>().add(tail)=n;
+        *core::ptr::addr_of_mut!(SC_MSGQ_TAIL).cast::<usize>().add(i)=(tail+1)%8;
+        *core::ptr::addr_of_mut!(SC_MSGQ_COUNT).cast::<usize>().add(i)=count+1;
+    }
+    syscall::SyscallResult::success(n as u64)
+}
+fn syscall_msgq_recv(handle: u64, buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>16 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_MSGQ_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); } }
+    let count=unsafe{*core::ptr::addr_of!(SC_MSGQ_COUNT).cast::<usize>().add(i)};
+    if count==0 { return syscall_error(syscall::EAGAIN); }
+    unsafe {
+        let head=*core::ptr::addr_of!(SC_MSGQ_HEAD).cast::<usize>().add(i);
+        let slot=core::ptr::addr_of!(SC_MSGQ).cast::<[[u8;256];8]>().add(i);
+        let n=*core::ptr::addr_of!(SC_MSGQ_LEN).cast::<[usize;8]>().add(i).cast::<usize>().add(head);
+        let slice=core::slice::from_raw_parts((*slot)[head].as_ptr(), n);
+        let r = sc_copy_to_user(buf_ptr, buf_len, slice);
+        *core::ptr::addr_of_mut!(SC_MSGQ_HEAD).cast::<usize>().add(i)=(head+1)%8;
+        *core::ptr::addr_of_mut!(SC_MSGQ_COUNT).cast::<usize>().add(i)=count-1;
+        match r { Ok(v)=>syscall::SyscallResult::success(v), Err(e)=>syscall_error(e) }
+    }
+}
+fn syscall_msgq_destroy(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>16 { return syscall_error(syscall::EINVAL); }
+    unsafe { *core::ptr::addr_of_mut!(SC_MSGQ_USED).cast::<bool>().add((handle-1) as usize)=false; *core::ptr::addr_of_mut!(SC_MSGQ_COUNT).cast::<usize>().add((handle-1) as usize)=0; }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_eventfd_create(initial: u64) -> syscall::SyscallResult {
+    for i in 0..64 { unsafe { let u=core::ptr::addr_of_mut!(SC_EVENTFD_USED).cast::<bool>().add(i); if !*u { *u=true; *core::ptr::addr_of_mut!(SC_EVENTFD).cast::<u64>().add(i)=initial; return syscall::SyscallResult::success(i as u64+1); } } }
+    syscall_error(syscall::ENOSPC)
+}
+fn syscall_eventfd_read(handle: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_EVENTFD_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); }
+        let v=*core::ptr::addr_of_mut!(SC_EVENTFD).cast::<u64>().add(i); *core::ptr::addr_of_mut!(SC_EVENTFD).cast::<u64>().add(i)=0; syscall::SyscallResult::success(v) }
+}
+fn syscall_eventfd_write(handle: u64, value: u64) -> syscall::SyscallResult {
+    if handle==0 || handle>64 { return syscall_error(syscall::EINVAL); }
+    let i=(handle-1) as usize;
+    unsafe { if !*core::ptr::addr_of!(SC_EVENTFD_USED).cast::<bool>().add(i) { return syscall_error(syscall::EINVAL); }
+        *core::ptr::addr_of_mut!(SC_EVENTFD).cast::<u64>().add(i)=(*core::ptr::addr_of!(SC_EVENTFD).cast::<u64>().add(i)).saturating_add(value); }
+    syscall::SyscallResult::success(0)
+}
+fn syscall_get_os_name(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { match sc_copy_cstr_to_user(buf_ptr,buf_len,b"AlphaOS") { Ok(n)=>syscall::SyscallResult::success(n), Err(e)=>syscall_error(e)} }
+fn syscall_get_os_version() -> syscall::SyscallResult { syscall::SyscallResult::success(((syscall::SYSCALL_ABI_MAJOR as u64)<<16)|(syscall::SYSCALL_ABI_MINOR as u64)) }
+fn syscall_get_hostname(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { syscall_get_system_name(buf_ptr, buf_len) }
+fn syscall_set_hostname(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { syscall_set_system_name(buf_ptr, buf_len) }
+fn syscall_get_kernel_version(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { match sc_copy_cstr_to_user(buf_ptr,buf_len,b"0.3.0-freestanding") { Ok(n)=>syscall::SyscallResult::success(n), Err(e)=>syscall_error(e)} }
+fn syscall_get_arch() -> syscall::SyscallResult { syscall::SyscallResult::success(0x8664) }
+fn syscall_get_cpu_features(buf_ptr: u64) -> syscall::SyscallResult {
+    #[repr(C)] struct F { arch: u64, bits: u64, has_sse: u64, has_apic: u64 }
+    let f=F{arch:0x8664,bits:64,has_sse:1,has_apic:1};
+    let bytes=unsafe{core::slice::from_raw_parts((&f as *const F).cast::<u8>(), core::mem::size_of::<F>())};
+    match sc_copy_to_user(buf_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>syscall_error(e) }
+}
+fn syscall_get_load_avg(buf_ptr: u64) -> syscall::SyscallResult {
+    #[repr(C)] struct L { l1:u64,l5:u64,l15:u64,proc_count:u64 }
+    let mut procs=1u64;
+    for i in 0..MAX_SPAWNED { unsafe { if SPAWNED[i].used && !SPAWNED[i].exited { procs+=1; } } }
+    let l=L{l1:procs,l5:procs,l15:procs,proc_count:procs};
+    let bytes=unsafe{core::slice::from_raw_parts((&l as *const L).cast::<u8>(), core::mem::size_of::<L>())};
+    match sc_copy_to_user(buf_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>syscall_error(e) }
+}
+fn syscall_sysinfo(buf_ptr: u64) -> syscall::SyscallResult { get_system_info(0, buf_ptr, 4096) }
+fn syscall_console_write(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { write_console(1, buf_ptr, buf_len) }
+fn syscall_console_read(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { read_console(0, buf_ptr, buf_len) }
+fn syscall_console_clear() -> syscall::SyscallResult {
+    let console = unsafe { &mut *SYSCALL_CONSOLE };
+    clear_screen(console.address, console.width, console.height, console.pitch, console.pixel_format);
+    console.cursor_y = Console::TOP;
+    console.cursor_x = Console::LEFT;
+    console.draw_header();
+    console.draw_prompt();
+    console.draw_caret();
+    syscall::SyscallResult::success(0)
+}
+fn syscall_console_set_color(_fg: u64, _bg: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_console_get_cursor(x_ptr: u64, y_ptr: u64) -> syscall::SyscallResult {
+    let console = unsafe { &*SYSCALL_CONSOLE };
+    let _=sc_write_u32(x_ptr, console.cursor_x as u32);
+    let _=sc_write_u32(y_ptr, console.cursor_y as u32);
+    syscall::SyscallResult::success(0)
+}
+fn syscall_console_set_cursor(_x: u64, _y: u64) -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
+fn syscall_debug_write(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { syscall_debug_log(buf_ptr, buf_len) }
+fn syscall_debug_read(buf_ptr: u64, buf_len: u64) -> syscall::SyscallResult { syscall_get_kernel_log(buf_ptr, buf_len) }
+fn syscall_get_last_error() -> syscall::SyscallResult { syscall::SyscallResult::success(unsafe { *core::ptr::addr_of!(SC_LAST_ERROR) }) }
+
+fn sc_path_exists(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); syscall::SyscallResult::success(if find_fs(&r,l).is_some(){1}else{0})
+}
+
+fn sc_path_is_dir(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); match find_fs(&r,l){Some(i)=>with_fs(|fs| syscall::SyscallResult::success(if fs[i].is_dir{1}else{0})),None=>syscall::SyscallResult::success(0)}
+}
+
+fn sc_path_is_file(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); match find_fs(&r,l){Some(i)=>with_fs(|fs| syscall::SyscallResult::success(if !fs[i].is_dir{1}else{0})),None=>syscall::SyscallResult::success(0)}
+}
+
+fn sc_file_size_path(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); match find_fs(&r,l){Some(i)=>with_fs(|fs| if fs[i].is_dir{syscall_error(syscall::EINVAL)}else{syscall::SyscallResult::success(fs[i].size as u64)}),None=>syscall_error(syscall::ENOENT)}
+}
+
+fn sc_file_delete_path(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_unlink(arg0,arg1)
+}
+
+fn sc_file_rename_path(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall_rename(arg0,arg1,arg2,arg3)
+}
+
+fn sc_dir_create(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_mkdir(arg0,arg1)
+}
+
+fn sc_dir_remove(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_rmdir(arg0,arg1)
+}
+
+fn sc_file_open_read(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_open(arg0,arg1,0,0)
+}
+
+fn sc_file_open_write(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_open(arg0,arg1,1,0)
+}
+
+fn sc_file_close_handle(arg0: u64) -> syscall::SyscallResult {
+    close_handle(arg0)
+}
+
+fn sc_file_read_handle(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    sys_file_read(arg0,arg1,arg2)
+}
+
+fn sc_file_write_handle(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    sys_file_write(arg0,arg1,arg2)
+}
+
+fn sc_file_seek_handle(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    sys_seek(arg0,arg1,arg2)
+}
+
+fn sc_file_tell(arg0: u64) -> syscall::SyscallResult {
+    let Some(slot)=file_handle_slot(arg0) else {return syscall_error(syscall::EBADF)}; syscall::SyscallResult::success(unsafe{OPEN_FILES[slot].offset as u64})
+}
+
+fn sc_file_eof(arg0: u64) -> syscall::SyscallResult {
+    let Some(slot)=file_handle_slot(arg0) else {return syscall_error(syscall::EBADF)}; let fi=unsafe{OPEN_FILES[slot].fs_index}; let sz=with_fs(|fs| if fi<MAX_FS_FILES {fs[fi].size}else{0}); let off=unsafe{OPEN_FILES[slot].offset}; syscall::SyscallResult::success(if off>=sz{1}else{0})
+}
+
+fn sc_file_flush(arg0: u64) -> syscall::SyscallResult {
+    syscall_fsync(arg0)
+}
+
+fn sc_file_set_size(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_truncate_handle(arg0,arg1)
+}
+
+fn sc_file_get_attr(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_file_stat_path(arg0,arg1,arg2)
+}
+
+fn sc_file_set_attr(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_chmod(arg0,arg1,arg2)
+}
+
+fn sc_dir_open(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_open(arg0,arg1,0,0)
+}
+
+fn sc_dir_read(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_readdir(arg0,arg1)
+}
+
+fn sc_dir_close(arg0: u64) -> syscall::SyscallResult {
+    close_handle(arg0)
+}
+
+fn sc_path_join(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> syscall::SyscallResult {
+    let base=match sc_read_user(arg0,arg1){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let name=match sc_read_user(arg2,arg3){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let mut tmp=[0u8;256]; let mut n=0usize; for &b in base.iter().take(200){tmp[n]=b;n+=1;} if n==0||tmp[n-1]!=b"/"[0]{if n<255{tmp[n]=b"/"[0];n+=1;}} for &b in name.iter().take(255-n){tmp[n]=b;n+=1;} match sc_copy_cstr_to_user(arg4,256,&tmp[..n]){Ok(v)=>syscall::SyscallResult::success(v),Err(e)=>syscall_error(e)}
+}
+
+fn sc_path_basename(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match sc_read_user(arg0,arg1){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let mut start=0; for (i,&b) in p.iter().enumerate(){if b==b'/'{start=i+1;}} match sc_copy_cstr_to_user(arg2,arg3,&p[start..]){Ok(v)=>syscall::SyscallResult::success(v),Err(e)=>syscall_error(e)}
+}
+
+fn sc_path_dirname(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match sc_read_user(arg0,arg1){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let mut end=0; for (i,&b) in p.iter().enumerate(){if b==b'/'{end=i;}} if end==0{end=1;} match sc_copy_cstr_to_user(arg2,arg3,&p[..end]){Ok(v)=>syscall::SyscallResult::success(v),Err(e)=>syscall_error(e)}
+}
+
+fn sc_file_read_all(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); let idx=match find_fs(&r,l){Some(i)=>i,None=>return syscall_error(syscall::ENOENT)}; let (is_dir,size)=with_fs(|fs|(fs[idx].is_dir,fs[idx].size)); if is_dir{return syscall_error(syscall::EINVAL);} let mut tmp=[0u8;MAX_FILE_SIZE]; with_fs(|fs|{tmp[..size].copy_from_slice(&fs[idx].data[..size]);}); match sc_copy_to_user(arg2,arg3,&tmp[..size]){Ok(n)=>syscall::SyscallResult::success(n),Err(e)=>syscall_error(e)}
+}
+
+fn sc_file_write_all(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let src=match sc_read_user(arg2,arg3){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); let n=core::cmp::min(src.len(),MAX_FILE_SIZE); if let Some(idx)=find_fs(&r,l){ with_fs(|fs|{ if fs[idx].is_dir{return;} fs[idx].data[..n].copy_from_slice(&src[..n]); for b in &mut fs[idx].data[n..fs[idx].size]{*b=0;} fs[idx].size=n; }); return syscall::SyscallResult::success(n as u64);} with_fs(|fs|{ for i in 0..MAX_FS_FILES{ if !fs[i].used{ fs[i].used=true; fs[i].is_dir=false; let nlm=core::cmp::min(l,64); fs[i].name=[0;64]; fs[i].name[..nlm].copy_from_slice(&r[..nlm]); fs[i].name_len=nlm; fs[i].size=n; fs[i].data[..n].copy_from_slice(&src[..n]); return syscall::SyscallResult::success(n as u64);} } syscall_error(syscall::ENOSPC) })
+}
+
+fn sc_file_append(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let src=match sc_read_user(arg2,arg3){Ok(s)=>s,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); let idx=match find_fs(&r,l){Some(i)=>i,None=>return syscall_error(syscall::ENOENT)}; with_fs(|fs|{ if fs[idx].is_dir{return syscall_error(syscall::EINVAL);} let can=core::cmp::min(src.len(), MAX_FILE_SIZE.saturating_sub(fs[idx].size)); let off=fs[idx].size; fs[idx].data[off..off+can].copy_from_slice(&src[..can]); fs[idx].size+=can; syscall::SyscallResult::success(can as u64) })
+}
+
+fn sc_file_copy_path(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall_copy_file(arg0,arg1,arg2,arg3)
+}
+
+fn sc_file_move_path(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let r=syscall_copy_file(arg0,arg1,arg2,arg3); if r.error!=0 {return r;} syscall_unlink(arg0,arg1)
+}
+
+fn sc_dir_list_count(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); let mut c=0u64; with_fs(|fs|{ for i in 0..MAX_FS_FILES{ if !fs[i].used{continue;} if l==1 && r[0]==b'/'{ if fs[i].name_len>0{c+=1;} continue;} if fs[i].name_len>l+1 && fs[i].name[..l]==r[..l] && fs[i].name[l]==b'/'{ let rest=&fs[i].name[l+1..fs[i].name_len]; if !rest.iter().any(|&b|b==b'/'){c+=1;} } } }); syscall::SyscallResult::success(c)
+}
+
+fn sc_fs_free_space() -> syscall::SyscallResult {
+    let mut used=0u64; with_fs(|fs|{ for i in 0..MAX_FS_FILES{ if fs[i].used{used+=fs[i].size as u64;} } }); syscall::SyscallResult::success((MAX_FS_FILES as u64 * MAX_FILE_SIZE as u64).saturating_sub(used))
+}
+
+fn sc_fs_total_space() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(MAX_FS_FILES as u64 * MAX_FILE_SIZE as u64)
+}
+
+fn sc_fs_file_count() -> syscall::SyscallResult {
+    let mut c=0u64; with_fs(|fs|{ for i in 0..MAX_FS_FILES{ if fs[i].used{c+=1;} } }); syscall::SyscallResult::success(c)
+}
+
+fn sc_path_normalize(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); match sc_copy_cstr_to_user(arg2,arg3,&r[..l]){Ok(v)=>syscall::SyscallResult::success(v),Err(e)=>syscall_error(e)}
+}
+
+fn sc_file_touch(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let p=match user_read_path(arg0,arg1){Ok(p)=>p,Err(e)=>return syscall_error(e)}; let r=resolve_path(p); let l=resolved_len(&r); if find_fs(&r,l).is_some(){ return syscall::SyscallResult::success(0);} with_fs(|fs|{ for i in 0..MAX_FS_FILES{ if !fs[i].used{ fs[i].used=true; fs[i].is_dir=false; fs[i].size=0; let nlm=core::cmp::min(l,64); fs[i].name=[0;64]; fs[i].name[..nlm].copy_from_slice(&r[..nlm]); fs[i].name_len=nlm; return syscall::SyscallResult::success(0);} } syscall_error(syscall::ENOSPC) })
+}
+
+fn sc_get_fd_flags(arg0: u64) -> syscall::SyscallResult {
+    syscall_fcntl(arg0, syscall::FCNTL_GETFL as u64, 0)
+}
+
+fn sc_set_fd_flags(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_fcntl(arg0, syscall::FCNTL_SETFL as u64, arg1)
+}
+
+fn sc_file_dup_handle(arg0: u64) -> syscall::SyscallResult {
+    syscall_dup(arg0)
+}
+
+fn sc_process_spawn(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    sys_spawn(arg0,arg1,arg2,arg3)
+}
+
+fn sc_process_exit(arg0: u64) -> syscall::SyscallResult {
+    sys_exit(arg0)
+}
+
+fn sc_process_wait(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    sys_wait(arg0,arg1,arg2)
+}
+
+fn sc_process_get_pid() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_process_get_ppid() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_process_kill(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_kill_process(arg0,arg1)
+}
+
+fn sc_process_list(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_list_processes(arg0,arg1.saturating_mul(4))
+}
+
+fn sc_process_info(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_process_info(arg0,arg1)
+}
+
+fn sc_process_name(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_get_proc_name(arg0,arg1,arg2)
+}
+
+fn sc_process_set_name(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_set_process_name(arg0,arg1)
+}
+
+fn sc_process_exists_pid(arg0: u64) -> syscall::SyscallResult {
+    syscall_process_exists(arg0)
+}
+
+fn sc_process_get_state(arg0: u64) -> syscall::SyscallResult {
+    if arg0==0||arg0==1{return syscall::SyscallResult::success(1);} for i in 0..MAX_SPAWNED{unsafe{ if SPAWNED[i].used && SPAWNED[i].pid as u64==arg0 { return syscall::SyscallResult::success(if SPAWNED[i].exited{2}else{1}); } }} syscall_error(syscall::ESRCH)
+}
+
+fn sc_process_get_exit(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_exit_code(arg0)
+}
+
+fn sc_process_current_name(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_proc_name(1,arg0,arg1)
+}
+
+fn sc_process_argc() -> syscall::SyscallResult {
+    syscall_get_arg_count()
+}
+
+fn sc_process_argv(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_get_arg(arg0,arg1,arg2)
+}
+
+fn sc_process_get_env(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall_get_env(arg0,arg1,arg2,arg3)
+}
+
+fn sc_process_set_env(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall_set_env(arg0,arg1,arg2,arg3)
+}
+
+fn sc_thread_get_tid() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_thread_yield() -> syscall::SyscallResult {
+    syscall_sched_yield()
+}
+
+fn sc_thread_sleep_ms(arg0: u64) -> syscall::SyscallResult {
+    syscall_sleep_ms(arg0)
+}
+
+fn sc_thread_set_name(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_set_thread_name(arg0,arg1,arg2)
+}
+
+fn sc_thread_get_name(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_get_thread_name(arg0,arg1,arg2)
+}
+
+fn sc_thread_set_priority(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_set_thread_priority(arg0,arg1)
+}
+
+fn sc_thread_get_priority(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_thread_priority(arg0)
+}
+
+fn sc_proc_get_uid() -> syscall::SyscallResult {
+    syscall_get_uid()
+}
+
+fn sc_proc_set_uid(arg0: u64) -> syscall::SyscallResult {
+    syscall_set_uid(arg0)
+}
+
+fn sc_proc_get_gid() -> syscall::SyscallResult {
+    syscall_get_gid()
+}
+
+fn sc_proc_set_gid(arg0: u64) -> syscall::SyscallResult {
+    syscall_set_gid(arg0)
+}
+
+fn sc_proc_times(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_process_times(arg0,arg1)
+}
+
+fn sc_proc_get_cwd(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_getcwd(arg0,arg1)
+}
+
+fn sc_proc_set_cwd(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_setcwd(arg0,arg1)
+}
+
+fn sc_proc_exec(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall_exec(arg0,arg1,arg2,arg3)
+}
+
+fn sc_proc_fork() -> syscall::SyscallResult {
+    syscall_fork()
+}
+
+fn sc_proc_waitpid(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_waitpid(arg0,arg1,arg2)
+}
+
+fn sc_proc_is_alive(arg0: u64) -> syscall::SyscallResult {
+    if arg0==0||arg0==1{return syscall::SyscallResult::success(1);} for i in 0..MAX_SPAWNED{unsafe{ if SPAWNED[i].used && SPAWNED[i].pid as u64==arg0 { return syscall::SyscallResult::success(if SPAWNED[i].exited{0}else{1}); } }} syscall::SyscallResult::success(0)
+}
+
+fn sc_proc_signal(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_kill_process(arg0,arg1)
+}
+
+fn sc_proc_count() -> syscall::SyscallResult {
+    let mut c=1u64; for i in 0..MAX_SPAWNED{unsafe{ if SPAWNED[i].used && !SPAWNED[i].exited{c+=1;} }} syscall::SyscallResult::success(c)
+}
+
+fn sc_proc_max() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(MAX_SPAWNED as u64)
+}
+
+fn sc_proc_self_status() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_mem_alloc(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0,arg1)
+}
+
+fn sc_mem_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_mem_realloc(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    if arg0==0 { return sys_heap_alloc(arg2,8); } let r=sys_heap_alloc(arg2,8); if r.error!=0 {return r;} let n=core::cmp::min(arg1 as usize, arg2 as usize); if n>0 { if let Err(e)=validate_user_buffer(arg0,n as u64,false){return syscall_error(e);} if let Err(e)=validate_user_buffer(r.value,n as u64,true){return syscall_error(e);} unsafe{core::ptr::copy_nonoverlapping(arg0 as *const u8, r.value as *mut u8, n);} } let _=sys_heap_free(arg0,arg1); r
+}
+
+fn sc_mem_map(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_map(arg0,arg1,arg2)
+}
+
+fn sc_mem_unmap(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_memory_unmap(arg0,arg1)
+}
+
+fn sc_mem_protect(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_protect(arg0,arg1,arg2)
+}
+
+fn sc_mem_info(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_memory_info(arg0)
+}
+
+fn sc_mem_stats(arg0: u64) -> syscall::SyscallResult {
+    syscall_memory_stats(arg0)
+}
+
+fn sc_mem_page_size() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(4096)
+}
+
+fn sc_mem_set(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_fill(arg0,arg1,arg2)
+}
+
+fn sc_mem_copy(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_copy(arg0,arg1,arg2)
+}
+
+fn sc_mem_compare(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_compare(arg0,arg1,arg2)
+}
+
+fn sc_mem_zero(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_memory_fill(arg0,0,arg1)
+}
+
+fn sc_mem_available() -> syscall::SyscallResult {
+    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(total.saturating_sub(used)) }
+}
+
+fn sc_mem_used() -> syscall::SyscallResult {
+    { let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(used) }
+}
+
+fn sc_mem_total() -> syscall::SyscallResult {
+    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(total) }
+}
+
+fn sc_heap_alloc_app(arg0: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0,8)
+}
+
+fn sc_heap_free_app(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_heap_stats_app(arg0: u64) -> syscall::SyscallResult {
+    syscall_heap_stats(arg0)
+}
+
+fn sc_mem_map_shared(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_map(arg0,arg1,arg2)
+}
+
+fn sc_mem_unmap_shared(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_memory_unmap(arg0,arg1)
+}
+
+fn sc_mem_flush(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if arg1==0{return syscall::SyscallResult::success(0);} if let Err(e)=validate_user_buffer(arg0,arg1,false){return syscall_error(e);} syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_lock(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if arg1==0{return syscall::SyscallResult::success(0);} if let Err(e)=validate_user_buffer(arg0,arg1,false){return syscall_error(e);} syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_unlock(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if arg1==0{return syscall::SyscallResult::success(0);} if let Err(e)=validate_user_buffer(arg0,arg1,false){return syscall_error(e);} syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_advise_app(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_advise(arg0,arg1,arg2)
+}
+
+fn sc_shm_create(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    shared_memory_create(arg0,arg1)
+}
+
+fn sc_mmap_anon(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0,4096)
+}
+
+fn sc_munmap_anon(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_mem_read_u64(arg0: u64) -> syscall::SyscallResult {
+    if let Err(e)=validate_user_buffer(arg0,8,false){return syscall_error(e);} syscall::SyscallResult::success(unsafe{core::ptr::read_unaligned(arg0 as *const u64)})
+}
+
+fn sc_mem_write_u64(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if let Err(e)=validate_user_buffer(arg0,8,true){return syscall_error(e);} unsafe{core::ptr::write_unaligned(arg0 as *mut u64,arg1);} syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_read_u32(arg0: u64) -> syscall::SyscallResult {
+    if let Err(e)=validate_user_buffer(arg0,4,false){return syscall_error(e);} syscall::SyscallResult::success(unsafe{core::ptr::read_unaligned(arg0 as *const u32)} as u64)
+}
+
+fn sc_mem_write_u32(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if let Err(e)=validate_user_buffer(arg0,4,true){return syscall_error(e);} unsafe{core::ptr::write_unaligned(arg0 as *mut u32,arg1 as u32);} syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_swap(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    let n=arg2 as usize; if n==0{return syscall::SyscallResult::success(0);} if let Err(e)=validate_user_buffer(arg0,arg2,false){return syscall_error(e);} if let Err(e)=validate_user_buffer(arg1,arg2,false){return syscall_error(e);} if let Err(e)=validate_user_buffer(arg0,arg2,true){return syscall_error(e);} if let Err(e)=validate_user_buffer(arg1,arg2,true){return syscall_error(e);} let mut i=0; while i<n { unsafe{ let pa=(arg0 as *mut u8).add(i); let pb=(arg1 as *mut u8).add(i); let t=*pa; *pa=*pb; *pb=t; } i+=1; } syscall::SyscallResult::success(n as u64)
+}
+
+fn sc_mem_fill_pattern(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    if arg3==0{return syscall::SyscallResult::success(0);} let pat=match sc_read_user(arg1,arg2){Ok(s)=>s,Err(e)=>return syscall_error(e)}; if pat.is_empty(){return syscall_error(syscall::EINVAL);} if let Err(e)=validate_user_buffer(arg0,arg3,true){return syscall_error(e);} let n=arg3 as usize; for i in 0..n { unsafe{ *((arg0 as *mut u8).add(i))=pat[i%pat.len()]; } } syscall::SyscallResult::success(arg3)
+}
+
+fn sc_mem_stats_ex(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_memory_info(arg0)
+}
+
+fn sc_heap_compact() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_mem_validate(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    match validate_user_buffer(arg0,arg1,false){Ok(())=>syscall::SyscallResult::success(1),Err(_)=>syscall::SyscallResult::success(0)}
+}
+
+fn sc_mem_dup(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    if arg1==0{return syscall::SyscallResult::success(0);} let r=sys_heap_alloc(arg1,8); if r.error!=0{return r;} if let Err(e)=validate_user_buffer(arg0,arg1,false){return syscall_error(e);} unsafe{core::ptr::copy_nonoverlapping(arg0 as *const u8, r.value as *mut u8, arg1 as usize);} syscall::SyscallResult::success(r.value)
+}
+
+fn sc_page_alloc(arg0: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0.saturating_mul(4096),4096)
+}
+
+fn sc_page_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1.saturating_mul(4096))
+}
+
+fn sc_time_now_sec() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(sc_ticks_ms()/1000)
+}
+
+fn sc_time_now_ms() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(sc_ticks_ms())
+}
+
+fn sc_time_now_ns() -> syscall::SyscallResult {
+    syscall_uptime_ns()
+}
+
+fn sc_time_monotonic(arg0: u64) -> syscall::SyscallResult {
+    syscall_clock_monotonic(arg0)
+}
+
+fn sc_time_realtime(arg0: u64) -> syscall::SyscallResult {
+    syscall_clock_realtime(arg0)
+}
+
+fn sc_time_sleep_ns(arg0: u64) -> syscall::SyscallResult {
+    sys_sleep(arg0)
+}
+
+fn sc_time_sleep_ms(arg0: u64) -> syscall::SyscallResult {
+    syscall_sleep_ms(arg0)
+}
+
+fn sc_time_sleep_sec(arg0: u64) -> syscall::SyscallResult {
+    syscall_sleep_ms(arg0.saturating_mul(1000))
+}
+
+fn sc_time_ticks() -> syscall::SyscallResult {
+    syscall_get_ticks()
+}
+
+fn sc_time_ticks_per_sec() -> syscall::SyscallResult {
+    syscall_ticks_per_second()
+}
+
+fn sc_time_uptime_ms() -> syscall::SyscallResult {
+    syscall_get_uptime_ms()
+}
+
+fn sc_time_deadline(arg0: u64) -> syscall::SyscallResult {
+    syscall_deadline_wait(arg0)
+}
+
+fn sc_timer_create(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_create_timer(arg0,arg1)
+}
+
+fn sc_timer_get(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_timer(arg0)
+}
+
+fn sc_timer_cancel(arg0: u64) -> syscall::SyscallResult {
+    syscall_cancel_timer(arg0)
+}
+
+fn sc_timer_set_ms(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_set_timer_ms(arg0,arg1)
+}
+
+fn sc_timer_remaining(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_timer_ms(arg0)
+}
+
+fn sc_clock_get_res(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let ts=syscall::TimeSpec{seconds:0,nanoseconds:1_000_000}; let bytes=unsafe{core::slice::from_raw_parts((&ts as *const syscall::TimeSpec).cast::<u8>(), core::mem::size_of::<syscall::TimeSpec>())}; match sc_copy_to_user(arg1,bytes.len() as u64,bytes){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)}
+}
+
+fn sc_alarm_set(arg0: u64) -> syscall::SyscallResult {
+    syscall_alarm(arg0)
+}
+
+fn sc_alarm_cancel() -> syscall::SyscallResult {
+    unsafe{*core::ptr::addr_of_mut!(SC_ALARM_MS)=0;} syscall::SyscallResult::success(0)
+}
+
+fn sc_ipc_mutex_create() -> syscall::SyscallResult {
+    syscall_create_mutex()
+}
+
+fn sc_ipc_mutex_lock(arg0: u64) -> syscall::SyscallResult {
+    syscall_lock_mutex(arg0)
+}
+
+fn sc_ipc_mutex_unlock(arg0: u64) -> syscall::SyscallResult {
+    syscall_unlock_mutex(arg0)
+}
+
+fn sc_ipc_mutex_destroy(arg0: u64) -> syscall::SyscallResult {
+    syscall_destroy_mutex(arg0)
+}
+
+fn sc_ipc_sem_create(arg0: u64) -> syscall::SyscallResult {
+    syscall_create_sem(arg0)
+}
+
+fn sc_ipc_sem_wait(arg0: u64) -> syscall::SyscallResult {
+    syscall_sem_wait(arg0)
+}
+
+fn sc_ipc_sem_post(arg0: u64) -> syscall::SyscallResult {
+    syscall_sem_post(arg0)
+}
+
+fn sc_ipc_sem_destroy(arg0: u64) -> syscall::SyscallResult {
+    syscall_sem_destroy(arg0)
+}
+
+fn sc_ipc_event_create(arg0: u64) -> syscall::SyscallResult {
+    syscall_create_event(arg0)
+}
+
+fn sc_ipc_event_signal(arg0: u64) -> syscall::SyscallResult {
+    syscall_signal_event(arg0)
+}
+
+fn sc_ipc_event_wait(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_wait_event(arg0,arg1)
+}
+
+fn sc_ipc_msg_create(arg0: u64) -> syscall::SyscallResult {
+    syscall_msgq_create(arg0)
+}
+
+fn sc_ipc_msg_send(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_msgq_send(arg0,arg1,arg2)
+}
+
+fn sc_ipc_msg_recv(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_msgq_recv(arg0,arg1,arg2)
+}
+
+fn sc_ipc_msg_destroy(arg0: u64) -> syscall::SyscallResult {
+    syscall_msgq_destroy(arg0)
+}
+
+fn sc_ipc_pipe_create(arg0: u64) -> syscall::SyscallResult {
+    pipe_create(arg0)
+}
+
+fn sc_ipc_pipe_read(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    pipe_read(handle_slot(arg0),arg1,arg2 as usize)
+}
+
+fn sc_ipc_pipe_write(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    pipe_write(handle_slot(arg0),arg1,arg2 as usize)
+}
+
+fn sc_ipc_channel_create(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    channel_pair_create(arg0,arg1)
+}
+
+fn sc_ipc_channel_close(arg0: u64) -> syscall::SyscallResult {
+    channel_close(arg0)
+}
+
+fn sc_net_socket_create(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    socket_create(arg0,arg1,arg2)
+}
+
+fn sc_net_socket_bind(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    socket_bind(arg0,arg1,arg2)
+}
+
+fn sc_net_socket_listen(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    socket_listen(arg0,arg1)
+}
+
+fn sc_net_socket_accept(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    socket_accept(arg0,arg1,arg2)
+}
+
+fn sc_net_socket_connect(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    socket_connect(arg0,arg1,arg2)
+}
+
+fn sc_net_socket_send(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::error(syscall::ENOTSUP)
+}
+
+fn sc_net_socket_recv(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::error(syscall::ENOTSUP)
+}
+
+fn sc_net_socket_close(arg0: u64) -> syscall::SyscallResult {
+    close_handle(arg0)
+}
+
+fn sc_net_socket_shutdown(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_socket_shutdown(arg0,arg1)
+}
+
+fn sc_net_socket_pair(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_socketpair(arg0,arg1,arg2)
+}
+
+fn sc_net_get_local_addr(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::error(syscall::ENOTSUP)
+}
+
+fn sc_net_get_remote_addr(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::error(syscall::ENOTSUP)
+}
+
+fn sc_net_set_nonblocking(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_fcntl(arg0, syscall::FCNTL_SETFL as u64, if arg1!=0{1}else{0})
+}
+
+fn sc_net_poll_socket(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let mut pfd=syscall::PollFd{handle:arg0, events:arg1 as u16, revents:0}; let bytes=unsafe{core::slice::from_raw_parts_mut((&mut pfd as *mut syscall::PollFd).cast::<u8>(),core::mem::size_of::<syscall::PollFd>())}; let _=bytes; let r=syscall_poll((&pfd as *const syscall::PollFd) as u64,1,0); if r.error!=0{return r;} syscall::SyscallResult::success(pfd.revents as u64)
+}
+
+fn sc_net_get_hostname(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_hostname(arg0,arg1)
+}
+
+fn sc_net_set_hostname(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_set_hostname(arg0,arg1)
+}
+
+fn sc_net_resolve_local(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::error(syscall::ENOTSUP)
+}
+
+fn sc_net_loopback_ping(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_net_socket_stats(arg0: u64) -> syscall::SyscallResult {
+    let mut used=0u64; for i in 0..MAX_SOCKETS{unsafe{ if SOCKETS[i].used{used+=1;} }} let mut buf=[0u8;8]; buf.copy_from_slice(&used.to_le_bytes()); match sc_copy_to_user(arg0,8,&buf){Ok(_)=>syscall::SyscallResult::success(used),Err(e)=>syscall_error(e)}
+}
+
+fn sc_net_if_count() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_sys_get_os_name(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_os_name(arg0,arg1)
+}
+
+fn sc_sys_get_os_version() -> syscall::SyscallResult {
+    syscall_get_os_version()
+}
+
+fn sc_sys_get_kernel_ver(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_kernel_version(arg0,arg1)
+}
+
+fn sc_sys_get_arch() -> syscall::SyscallResult {
+    syscall_get_arch()
+}
+
+fn sc_sys_get_cpu_count() -> syscall::SyscallResult {
+    syscall_get_cpu_count()
+}
+
+fn sc_sys_get_cpu_features(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_cpu_features(arg0)
+}
+
+fn sc_sys_get_uptime() -> syscall::SyscallResult {
+    syscall_get_uptime_ms()
+}
+
+fn sc_sys_get_load_avg(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_load_avg(arg0)
+}
+
+fn sc_sys_info_ex(arg0: u64) -> syscall::SyscallResult {
+    syscall_sysinfo(arg0)
+}
+
+fn sc_sys_get_random(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_getrandom(arg0,arg1)
+}
+
+fn sc_sys_get_boot_info(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_boot_info(arg0)
+}
+
+fn sc_sys_get_console_size(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_console_size(arg0)
+}
+
+fn sc_sys_set_console_mode(arg0: u64) -> syscall::SyscallResult {
+    syscall_set_console_mode(arg0)
+}
+
+fn sc_sys_reboot(arg0: u64) -> syscall::SyscallResult {
+    reboot_system(arg0)
+}
+
+fn sc_sys_shutdown(arg0: u64) -> syscall::SyscallResult {
+    reboot_system(arg0)
+}
+
+fn sc_sys_debug_log(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_debug_log(arg0,arg1)
+}
+
+fn sc_sys_get_kernel_log(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_kernel_log(arg0,arg1)
+}
+
+fn sc_sys_get_last_error() -> syscall::SyscallResult {
+    syscall_get_last_error()
+}
+
+fn sc_sys_set_last_error(arg0: u64) -> syscall::SyscallResult {
+    sc_set_last_error(arg0); syscall::SyscallResult::success(0)
+}
+
+fn sc_sys_get_abi() -> syscall::SyscallResult {
+    syscall::SyscallResult::success((u64::from(syscall::SYSCALL_ABI_MAJOR)<<16)|u64::from(syscall::SYSCALL_ABI_MINOR))
+}
+
+fn sc_kmem_alloc(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0,arg1)
+}
+
+fn sc_kmem_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_kmem_map(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    if arg0==0 {return sys_heap_alloc(arg1,4096);} syscall::SyscallResult::success(arg0)
+}
+
+fn sc_kmem_unmap(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_kmem_protect(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_mprotect(arg0,arg1,arg2)
+}
+
+fn sc_kmem_query(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; let info=syscall::MemoryInfo{managed_bytes:total,allocated_bytes:used,available_bytes:total.saturating_sub(used)}; let b=unsafe{core::slice::from_raw_parts((&info as *const syscall::MemoryInfo).cast::<u8>(),core::mem::size_of::<syscall::MemoryInfo>())}; match sc_copy_to_user(arg1,b.len() as u64,b){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)} }
+}
+
+fn sc_kmem_stats(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_memory_info(arg0)
+}
+
+fn sc_kmem_flush(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kpage_alloc(arg0: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0.saturating_mul(4096),4096)
+}
+
+fn sc_kpage_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1.saturating_mul(4096))
+}
+
+fn sc_kpage_map(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(arg0)
+}
+
+fn sc_kpage_unmap(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kheap_info(arg0: u64) -> syscall::SyscallResult {
+    syscall_heap_stats(arg0)
+}
+
+fn sc_kheap_compact() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kmem_zero(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_memory_fill(arg0,0,arg1)
+}
+
+fn sc_kmem_copy(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_copy(arg0,arg1,arg2)
+}
+
+fn sc_kmem_compare(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_memory_compare(arg0,arg1,arg2)
+}
+
+fn sc_kphys_alloc(arg0: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0.saturating_mul(4096),4096)
+}
+
+fn sc_kphys_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1.saturating_mul(4096))
+}
+
+fn sc_kmem_barrier() -> syscall::SyscallResult {
+    unsafe{core::arch::asm!("mfence");} syscall::SyscallResult::success(0)
+}
+
+fn sc_ksched_yield() -> syscall::SyscallResult {
+    syscall_sched_yield()
+}
+
+fn sc_ksched_set_priority(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_set_thread_priority(arg0,arg1)
+}
+
+fn sc_ksched_get_priority(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_thread_priority(arg0)
+}
+
+fn sc_kthread_create(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    let mut pid=0u64; for i in 0..MAX_SPAWNED{unsafe{ if !SPAWNED[i].used { SPAWNED[i].used=true; SPAWNED[i].exited=false; SPAWNED[i].exit_code=0; SPAWNED[i].pid=((i as u32)+2) as u64; pid=SPAWNED[i].pid; break; } }} if pid==0{return syscall_error(syscall::ENOSPC);} syscall::SyscallResult::success(pid)
+}
+
+fn sc_kthread_exit(arg0: u64) -> syscall::SyscallResult {
+    sys_exit(arg0)
+}
+
+fn sc_kthread_join(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_wait(arg0,arg1,0)
+}
+
+fn sc_kthread_sleep(arg0: u64) -> syscall::SyscallResult {
+    syscall_sleep_ms(arg0)
+}
+
+fn sc_kthread_wake(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(if arg0!=0{1}else{0})
+}
+
+fn sc_kprocess_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    sys_spawn(arg0,arg1,arg2,arg3)
+}
+
+fn sc_kprocess_exit(arg0: u64) -> syscall::SyscallResult {
+    sys_exit(arg0)
+}
+
+fn sc_kprocess_kill(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_kill_process(arg0,arg1)
+}
+
+fn sc_kprocess_wait(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    sys_wait(arg0,arg1,arg2)
+}
+
+fn sc_kprocess_info(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_process_info(arg0,arg1)
+}
+
+fn sc_kprocess_list(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_list_processes(arg0,arg1.saturating_mul(4))
+}
+
+fn sc_ktask_switch() -> syscall::SyscallResult {
+    unsafe{core::arch::asm!("pause");} syscall::SyscallResult::success(0)
+}
+
+fn sc_kset_affinity(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(arg1)
+}
+
+fn sc_kget_affinity(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_kcpu_id() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kirq_disable() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kirq_enable() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kdev_list(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    device_list(arg0,arg1)
+}
+
+fn sc_kdev_open(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    device_open(arg0,arg1)
+}
+
+fn sc_kdev_close(arg0: u64) -> syscall::SyscallResult {
+    close_handle(arg0)
+}
+
+fn sc_kdev_read(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    device_read(arg0,arg1,arg2)
+}
+
+fn sc_kdev_write(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    device_write(arg0,arg1,arg2)
+}
+
+fn sc_kdev_ioctl(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    syscall_ioctl(arg0,arg1,arg2)
+}
+
+fn sc_kdev_poll(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    let mut pfd=syscall::PollFd{handle:arg0,events:arg1 as u16,revents:0}; let r=syscall_poll((&pfd as *const syscall::PollFd) as u64,1,arg2); if r.error!=0{return r;} syscall::SyscallResult::success(pfd.revents as u64)
+}
+
+fn sc_kdev_mmap(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg2,4096)
+}
+
+fn sc_kdev_irq_register(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(arg0)
+}
+
+fn sc_kdev_irq_unregister(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kdev_dma_alloc(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_alloc(arg0,core::cmp::max(arg1,4096))
+}
+
+fn sc_kdev_dma_free(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    sys_heap_free(arg0,arg1)
+}
+
+fn sc_kio_port_read(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let port=arg0 as u16; let v:u64 = match arg1 { 1=>{let mut x:u8; unsafe{core::arch::asm!("in al, dx", out("al") x, in("dx") port);} x as u64 }, 2=>{let mut x:u16; unsafe{core::arch::asm!("in ax, dx", out("ax") x, in("dx") port);} x as u64 }, 4=>{let mut x:u32; unsafe{core::arch::asm!("in eax, dx", out("eax") x, in("dx") port);} x as u64 }, _=>return syscall_error(syscall::EINVAL)}; syscall::SyscallResult::success(v)
+}
+
+fn sc_kio_port_write(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    let port=arg0 as u16; match arg1 { 1=>unsafe{core::arch::asm!("out dx, al", in("dx") port, in("al") arg2 as u8);}, 2=>unsafe{core::arch::asm!("out dx, ax", in("dx") port, in("ax") arg2 as u16);}, 4=>unsafe{core::arch::asm!("out dx, eax", in("dx") port, in("eax") arg2 as u32);}, _=>return syscall_error(syscall::EINVAL)} syscall::SyscallResult::success(0)
+}
+
+fn sc_kfb_get_info(arg0: u64) -> syscall::SyscallResult {
+    let con=unsafe{&*SYSCALL_CONSOLE}; #[repr(C)] struct Fb{addr:u64,width:u32,height:u32,pitch:u32,fmt:u32} let fb=Fb{addr:con.address as u64,width:con.width as u32,height:con.height as u32,pitch:con.pitch as u32,fmt:0u32}}; let b=unsafe{core::slice::from_raw_parts((&fb as *const Fb).cast::<u8>(),core::mem::size_of::<Fb>())}; match sc_copy_to_user(arg0,b.len() as u64,b){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)}
+}
+
+fn sc_kfb_put_pixel(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> syscall::SyscallResult {
+    let con=unsafe{&mut *SYSCALL_CONSOLE}; let x=arg0 as usize; let y=arg1 as usize; if x>=con.width||y>=con.height{return syscall_error(syscall::EINVAL);} { let offset=y*con.pitch + x*4; unsafe{ let p=con.address.add(offset); *p=arg4 as u8; *p.add(1)=arg3 as u8; *p.add(2)=arg2 as u8; *p.add(3)=0; } syscall::SyscallResult::success(0) }
+}
+
+fn sc_kfb_clear(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
+    let con=unsafe{&mut *SYSCALL_CONSOLE}; clear_screen(con.address,con.width,con.height,con.pitch,con.pixel_format); syscall::SyscallResult::success(0)
+}
+
+fn sc_kinput_poll(arg0: u64) -> syscall::SyscallResult {
+    if let Some(ev)=input::dequeue_for(USER_INPUT_TARGET){ if arg0!=0 { let b=unsafe{core::slice::from_raw_parts((&ev as *const syscall::InputEvent).cast::<u8>(),core::mem::size_of::<syscall::InputEvent>())}; let _=sc_copy_to_user(arg0,b.len() as u64,b);} syscall::SyscallResult::success(1)} else {syscall::SyscallResult::success(0)}
+}
+
+fn sc_kinput_read(arg0: u64) -> syscall::SyscallResult {
+    loop { if let Some(ev)=input::dequeue_for(USER_INPUT_TARGET){ if arg0!=0 { let b=unsafe{core::slice::from_raw_parts((&ev as *const syscall::InputEvent).cast::<u8>(),core::mem::size_of::<syscall::InputEvent>())}; let _=sc_copy_to_user(arg0,b.len() as u64,b);} return syscall::SyscallResult::success(1); } unsafe{core::arch::asm!("hlt");} }
+}
+
+fn sc_kconsole_write(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    write_console(1,arg0,arg1)
+}
+
+fn sc_ksec_get_uid() -> syscall::SyscallResult {
+    syscall_get_uid()
+}
+
+fn sc_ksec_set_uid(arg0: u64) -> syscall::SyscallResult {
+    syscall_set_uid(arg0)
+}
+
+fn sc_ksec_get_gid() -> syscall::SyscallResult {
+    syscall_get_gid()
+}
+
+fn sc_ksec_set_gid(arg0: u64) -> syscall::SyscallResult {
+    syscall_set_gid(arg0)
+}
+
+fn sc_ksec_drop_privs() -> syscall::SyscallResult {
+    unsafe{*core::ptr::addr_of_mut!(SC_UID)=1000; *core::ptr::addr_of_mut!(SC_GID)=1000;} syscall::SyscallResult::success(0)
+}
+
+fn sc_ksec_get_caps() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0xFFFF_FFFF)
+}
+
+fn sc_ksec_set_caps(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kobj_create(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(arg0.wrapping_add(1))
+}
+
+fn sc_kobj_close(arg0: u64) -> syscall::SyscallResult {
+    close_handle(arg0)
+}
+
+fn sc_kobj_dup(arg0: u64) -> syscall::SyscallResult {
+    syscall_dup(arg0)
+}
+
+fn sc_kobj_ref(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+fn sc_kobj_unref(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kobj_get_type(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(handle_kind(arg0) as u64)
+}
+
+fn sc_ksignal_send(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_kill_process(arg0,arg1)
+}
+
+fn sc_ksignal_mask(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_ksignal_wait(arg0: u64) -> syscall::SyscallResult {
+    sys_sleep(1_000_000); syscall::SyscallResult::success(0)
+}
+
+fn sc_kevent_create(arg0: u64) -> syscall::SyscallResult {
+    syscall_create_event(arg0)
+}
+
+fn sc_kevent_signal(arg0: u64) -> syscall::SyscallResult {
+    syscall_signal_event(arg0)
+}
+
+fn sc_kevent_wait(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_wait_event(arg0,arg1)
+}
+
+fn sc_kevent_reset(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kboot_get_info(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_boot_info(arg0)
+}
+
+fn sc_kboot_get_cmdline(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    match sc_copy_cstr_to_user(arg0,arg1,b"alphaos console=tty0"){Ok(n)=>syscall::SyscallResult::success(n),Err(e)=>syscall_error(e)}
+}
+
+fn sc_kboot_get_modules(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kdebug_log_write(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_debug_log(arg0,arg1)
+}
+
+fn sc_kdebug_log_read(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_get_kernel_log(arg0,arg1)
+}
+
+fn sc_kdebug_breakpoint() -> syscall::SyscallResult {
+    unsafe{core::arch::asm!("int3");} syscall::SyscallResult::success(0)
+}
+
+fn sc_kdebug_dump_regs(arg0: u64) -> syscall::SyscallResult {
+    syscall::SyscallResult::success(0)
+}
+
+fn sc_kdebug_trace(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    syscall_debug_log(arg0,arg1)
+}
+
+fn sc_kpanic(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    let msg=match sc_read_user(arg0,arg1){Ok(s)=>s,Err(_)=>b"kernel panic" as &[u8]};
+    unsafe{ for &b in b"[PANIC] ".iter().chain(msg.iter()).chain(b"
+".iter()) { let idx=KLOG_LEN%KLOG_SIZE; KLOG[idx]=b; KLOG_LEN=KLOG_LEN.saturating_add(1);} core::arch::asm!("cli"); loop{core::arch::asm!("hlt");} }
+}
+
+fn sc_kget_version() -> syscall::SyscallResult {
+    syscall_get_os_version()
+}
+
+fn sc_kget_build_info(arg0: u64, arg1: u64) -> syscall::SyscallResult {
+    match sc_copy_cstr_to_user(arg0,arg1,b"AlphaOS freestanding x86_64 m1"){Ok(n)=>syscall::SyscallResult::success(n),Err(e)=>syscall_error(e)}
+}
+
+fn sc_kget_uptime() -> syscall::SyscallResult {
+    syscall_get_uptime_ms()
+}
+
+fn sc_kget_ticks() -> syscall::SyscallResult {
+    syscall_get_ticks()
+}
+
+fn sc_kcpu_count() -> syscall::SyscallResult {
+    syscall_get_cpu_count()
+}
+
+fn sc_kcpu_features(arg0: u64) -> syscall::SyscallResult {
+    syscall_get_cpu_features(arg0)
+}
+
+fn sc_kpower_reboot(arg0: u64) -> syscall::SyscallResult {
+    reboot_system(arg0)
+}
+
+fn sc_kpower_shutdown(arg0: u64) -> syscall::SyscallResult {
+    reboot_system(arg0)
+}
+
+fn sc_kpower_suspend(arg0: u64) -> syscall::SyscallResult {
+    unsafe{core::arch::asm!("hlt");} syscall::SyscallResult::success(0)
+}
+
+fn sc_ksyscall_count() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(syscall::SYSCALL_COUNT as u64)
+}
+
+fn sc_kmilestone_check() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(1)
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(
     number: u64,
     arg0: u64,
@@ -929,6 +3222,455 @@ extern "C" fn syscall_dispatch(
         Some(syscall::SyscallId::ChannelReceive) => channel_receive(arg0, arg1, arg2, arg3),
         Some(syscall::SyscallId::ChannelClose) => channel_close(arg0),
         Some(syscall::SyscallId::SharedMemoryCreate) => shared_memory_create(arg0, arg1),
+        Some(syscall::SyscallId::GetCwd) => syscall_getcwd(arg0, arg1),
+        Some(syscall::SyscallId::SetCwd) => syscall_setcwd(arg0, arg1),
+        Some(syscall::SyscallId::Mkdir) => syscall_mkdir(arg0, arg1),
+        Some(syscall::SyscallId::Rmdir) => syscall_rmdir(arg0, arg1),
+        Some(syscall::SyscallId::Unlink) => syscall_unlink(arg0, arg1),
+        Some(syscall::SyscallId::Rename) => syscall_rename(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::Ftruncate) => syscall_truncate_handle(arg0, arg1),
+        Some(syscall::SyscallId::Dup) => syscall_dup(arg0),
+        Some(syscall::SyscallId::Dup2) => syscall_dup2(arg0, arg1),
+        Some(syscall::SyscallId::Access) => syscall_access(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Fcntl) => syscall_fcntl(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Ioctl) => syscall_ioctl(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetRandom) => syscall_getrandom(arg0, arg1),
+        Some(syscall::SyscallId::GetTicks) => syscall_get_ticks(),
+        Some(syscall::SyscallId::NanoSleep) => syscall_nanosleep(arg0, arg1),
+        Some(syscall::SyscallId::Mprotect) => syscall_mprotect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetProcessInfo) => syscall_get_process_info(arg0, arg1),
+        Some(syscall::SyscallId::KillProcess) => syscall_kill_process(arg0, arg1),
+        Some(syscall::SyscallId::GetArgCount) => syscall_get_arg_count(),
+        Some(syscall::SyscallId::GetArg) => syscall_get_arg(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetEnv) => syscall_get_env(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::SetEnv) => syscall_set_env(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::StatFs) => syscall_statfs(arg0, arg1),
+        Some(syscall::SyscallId::Fsync) => syscall_fsync(arg0),
+        Some(syscall::SyscallId::Poll) => syscall_poll(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Pipe2) => syscall_pipe2(arg0, arg1),
+        Some(syscall::SyscallId::SocketShutdown) => syscall_socket_shutdown(arg0, arg1),
+        Some(syscall::SyscallId::SocketPair) => syscall_socketpair(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetResourceLimit) => syscall_get_rlimit(arg0, arg1),
+        Some(syscall::SyscallId::SetResourceLimit) => syscall_set_rlimit(arg0, arg1),
+        Some(syscall::SyscallId::GetSystemName) => syscall_get_system_name(arg0, arg1),
+        Some(syscall::SyscallId::SetSystemName) => syscall_set_system_name(arg0, arg1),
+        Some(syscall::SyscallId::CreateTimer) => syscall_create_timer(arg0, arg1),
+        Some(syscall::SyscallId::GetTimer) => syscall_get_timer(arg0),
+        Some(syscall::SyscallId::CancelTimer) => syscall_cancel_timer(arg0),
+        Some(syscall::SyscallId::CreateEvent) => syscall_create_event(arg0),
+        Some(syscall::SyscallId::SignalEvent) => syscall_signal_event(arg0),
+        Some(syscall::SyscallId::WaitEvent) => syscall_wait_event(arg0, arg1),
+        Some(syscall::SyscallId::GetMemoryInfo) => syscall_get_memory_info(arg0),
+        Some(syscall::SyscallId::DebugLog) => syscall_debug_log(arg0, arg1),
+        Some(syscall::SyscallId::GetConsoleSize) => syscall_get_console_size(arg0),
+        Some(syscall::SyscallId::SetConsoleMode) => syscall_set_console_mode(arg0),
+        Some(syscall::SyscallId::GetBootInfo) => syscall_get_boot_info(arg0),
+        Some(syscall::SyscallId::GetKernelLog) => syscall_get_kernel_log(arg0, arg1),
+        Some(syscall::SyscallId::SetThreadName) => syscall_set_thread_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetThreadName) => syscall_get_thread_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetCpuCount) => syscall_get_cpu_count(),
+        Some(syscall::SyscallId::GetUptimeMs) => syscall_get_uptime_ms(),
+        Some(syscall::SyscallId::ListProcesses) => syscall_list_processes(arg0, arg1),
+        Some(syscall::SyscallId::GetProcName) => syscall_get_proc_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetParentPid) => syscall_getppid(),
+        Some(syscall::SyscallId::GetThreadId) => syscall_gettid(),
+        Some(syscall::SyscallId::SchedYield) => syscall_sched_yield(),
+        Some(syscall::SyscallId::SetProcessName) => syscall_set_process_name(arg0, arg1),
+        Some(syscall::SyscallId::GetProcessName) => syscall_get_process_name2(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Fork) => syscall_fork(),
+        Some(syscall::SyscallId::Exec) => syscall_exec(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::WaitPid) => syscall_waitpid(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetExitCode) => syscall_get_exit_code(arg0),
+        Some(syscall::SyscallId::SetThreadPriority) => syscall_set_thread_priority(arg0, arg1),
+        Some(syscall::SyscallId::GetThreadPriority) => syscall_get_thread_priority(arg0),
+        Some(syscall::SyscallId::ProcessExists) => syscall_process_exists(arg0),
+        Some(syscall::SyscallId::GetProcessList) => syscall_get_process_list(arg0, arg1),
+        Some(syscall::SyscallId::KillThread) => syscall_kill_thread(arg0),
+        Some(syscall::SyscallId::GetCurrentTid) => syscall_get_current_tid(),
+        Some(syscall::SyscallId::SetUid) => syscall_set_uid(arg0),
+        Some(syscall::SyscallId::GetUserId) => syscall_get_uid(),
+        Some(syscall::SyscallId::SetGid) => syscall_set_gid(arg0),
+        Some(syscall::SyscallId::GetGroupId) => syscall_get_gid(),
+        Some(syscall::SyscallId::GetProcessTimes) => syscall_get_process_times(arg0, arg1),
+        Some(syscall::SyscallId::OpenAt) => syscall_openat(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ReadAt) => syscall_readat(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::WriteAt) => syscall_writeat(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileTruncatePath) => syscall_file_truncate_path(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileStatPath) => syscall_file_stat_path(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Symlink) => syscall_symlink(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ReadLink) => syscall_readlink(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::Link) => syscall_link(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::Chmod) => syscall_chmod(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Chown) => syscall_chown(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::Lseek64) => syscall_lseek64(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FstatHandle) => syscall_fstat2(arg0, arg1),
+        Some(syscall::SyscallId::IsATTY) => syscall_isatty(arg0),
+        Some(syscall::SyscallId::TtyName) => syscall_ttyname(arg0, arg1, arg2),
+        Some(syscall::SyscallId::GetDents) => syscall_getdents(arg0, arg1, arg2),
+        Some(syscall::SyscallId::RealPath) => syscall_realpath(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::CopyFile) => syscall_copy_file(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::MakeFifo) => syscall_mkfifo(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileLock) => syscall_file_lock(arg0, arg1),
+        Some(syscall::SyscallId::FileUnlock) => syscall_file_unlock(arg0),
+        Some(syscall::SyscallId::MemoryMap) => syscall_memory_map(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemoryUnmap) => syscall_memory_unmap(arg0, arg1),
+        Some(syscall::SyscallId::MemoryProtect) => syscall_memory_protect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemoryAdvise) => syscall_memory_advise(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemoryStats) => syscall_memory_stats(arg0),
+        Some(syscall::SyscallId::HeapStats) => syscall_heap_stats(arg0),
+        Some(syscall::SyscallId::PageSize) => syscall_page_size(),
+        Some(syscall::SyscallId::MemoryFill) => syscall_memory_fill(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemoryCompare) => syscall_memory_compare(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemoryCopy) => syscall_memory_copy(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ClockMonotonic) => syscall_clock_monotonic(arg0),
+        Some(syscall::SyscallId::ClockRealtime) => syscall_clock_realtime(arg0),
+        Some(syscall::SyscallId::SetTimerMs) => syscall_set_timer_ms(arg0, arg1),
+        Some(syscall::SyscallId::GetTimerMs) => syscall_get_timer_ms(arg0),
+        Some(syscall::SyscallId::SleepMs) => syscall_sleep_ms(arg0),
+        Some(syscall::SyscallId::Alarm) => syscall_alarm(arg0),
+        Some(syscall::SyscallId::TimeNow) => syscall_time_now(),
+        Some(syscall::SyscallId::TicksPerSecond) => syscall_ticks_per_second(),
+        Some(syscall::SyscallId::UptimeNs) => syscall_uptime_ns(),
+        Some(syscall::SyscallId::DeadlineWait) => syscall_deadline_wait(arg0),
+        Some(syscall::SyscallId::CreateMutex) => syscall_create_mutex(),
+        Some(syscall::SyscallId::LockMutex) => syscall_lock_mutex(arg0),
+        Some(syscall::SyscallId::UnlockMutex) => syscall_unlock_mutex(arg0),
+        Some(syscall::SyscallId::DestroyMutex) => syscall_destroy_mutex(arg0),
+        Some(syscall::SyscallId::CreateSemaphore) => syscall_create_sem(arg0),
+        Some(syscall::SyscallId::SemWait) => syscall_sem_wait(arg0),
+        Some(syscall::SyscallId::SemPost) => syscall_sem_post(arg0),
+        Some(syscall::SyscallId::SemDestroy) => syscall_sem_destroy(arg0),
+        Some(syscall::SyscallId::CreateCondvar) => syscall_create_condvar(),
+        Some(syscall::SyscallId::CondvarWait) => syscall_condvar_wait(arg0, arg1),
+        Some(syscall::SyscallId::CondvarSignal) => syscall_condvar_signal(arg0),
+        Some(syscall::SyscallId::CondvarBroadcast) => syscall_condvar_broadcast(arg0),
+        Some(syscall::SyscallId::FutexWait) => syscall_futex_wait(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FutexWake) => syscall_futex_wake(arg0, arg1),
+        Some(syscall::SyscallId::MsgQueueCreate) => syscall_msgq_create(arg0),
+        Some(syscall::SyscallId::MsgQueueSend) => syscall_msgq_send(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MsgQueueRecv) => syscall_msgq_recv(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MsgQueueDestroy) => syscall_msgq_destroy(arg0),
+        Some(syscall::SyscallId::EventfdCreate) => syscall_eventfd_create(arg0),
+        Some(syscall::SyscallId::EventfdRead) => syscall_eventfd_read(arg0),
+        Some(syscall::SyscallId::EventfdWrite) => syscall_eventfd_write(arg0, arg1),
+        Some(syscall::SyscallId::GetOsName) => syscall_get_os_name(arg0, arg1),
+        Some(syscall::SyscallId::GetOsVersion) => syscall_get_os_version(),
+        Some(syscall::SyscallId::GetHostname) => syscall_get_hostname(arg0, arg1),
+        Some(syscall::SyscallId::SetHostname) => syscall_set_hostname(arg0, arg1),
+        Some(syscall::SyscallId::GetKernelVersion) => syscall_get_kernel_version(arg0, arg1),
+        Some(syscall::SyscallId::GetArch) => syscall_get_arch(),
+        Some(syscall::SyscallId::GetCpuFeatures) => syscall_get_cpu_features(arg0),
+        Some(syscall::SyscallId::GetLoadAvg) => syscall_get_load_avg(arg0),
+        Some(syscall::SyscallId::SysInfo) => syscall_sysinfo(arg0),
+        Some(syscall::SyscallId::ConsoleWrite) => syscall_console_write(arg0, arg1),
+        Some(syscall::SyscallId::ConsoleRead) => syscall_console_read(arg0, arg1),
+        Some(syscall::SyscallId::ConsoleClear) => syscall_console_clear(),
+        Some(syscall::SyscallId::ConsoleSetColor) => syscall_console_set_color(arg0, arg1),
+        Some(syscall::SyscallId::ConsoleGetCursor) => syscall_console_get_cursor(arg0, arg1),
+        Some(syscall::SyscallId::ConsoleSetCursor) => syscall_console_set_cursor(arg0, arg1),
+        Some(syscall::SyscallId::DebugWrite) => syscall_debug_write(arg0, arg1),
+        Some(syscall::SyscallId::DebugRead) => syscall_debug_read(arg0, arg1),
+        Some(syscall::SyscallId::GetLastError) => syscall_get_last_error(),
+        Some(syscall::SyscallId::PathExists) => sc_path_exists(arg0, arg1),
+        Some(syscall::SyscallId::PathIsDir) => sc_path_is_dir(arg0, arg1),
+        Some(syscall::SyscallId::PathIsFile) => sc_path_is_file(arg0, arg1),
+        Some(syscall::SyscallId::FileSizePath) => sc_file_size_path(arg0, arg1),
+        Some(syscall::SyscallId::FileDeletePath) => sc_file_delete_path(arg0, arg1),
+        Some(syscall::SyscallId::FileRenamePath) => sc_file_rename_path(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::DirCreate) => sc_dir_create(arg0, arg1),
+        Some(syscall::SyscallId::DirRemove) => sc_dir_remove(arg0, arg1),
+        Some(syscall::SyscallId::FileOpenRead) => sc_file_open_read(arg0, arg1),
+        Some(syscall::SyscallId::FileOpenWrite) => sc_file_open_write(arg0, arg1),
+        Some(syscall::SyscallId::FileCloseHandle) => sc_file_close_handle(arg0),
+        Some(syscall::SyscallId::FileReadHandle) => sc_file_read_handle(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileWriteHandle) => sc_file_write_handle(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileSeekHandle) => sc_file_seek_handle(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileTell) => sc_file_tell(arg0),
+        Some(syscall::SyscallId::FileEof) => sc_file_eof(arg0),
+        Some(syscall::SyscallId::FileFlush) => sc_file_flush(arg0),
+        Some(syscall::SyscallId::FileSetSize) => sc_file_set_size(arg0, arg1),
+        Some(syscall::SyscallId::FileGetAttr) => sc_file_get_attr(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileSetAttr) => sc_file_set_attr(arg0, arg1, arg2),
+        Some(syscall::SyscallId::DirOpen) => sc_dir_open(arg0, arg1),
+        Some(syscall::SyscallId::DirRead) => sc_dir_read(arg0, arg1),
+        Some(syscall::SyscallId::DirClose) => sc_dir_close(arg0),
+        Some(syscall::SyscallId::PathJoin) => sc_path_join(arg0, arg1, arg2, arg3, arg4),
+        Some(syscall::SyscallId::PathBasename) => sc_path_basename(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::PathDirname) => sc_path_dirname(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileReadAll) => sc_file_read_all(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileWriteAll) => sc_file_write_all(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileAppend) => sc_file_append(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileCopyPath) => sc_file_copy_path(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileMovePath) => sc_file_move_path(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::DirListCount) => sc_dir_list_count(arg0, arg1),
+        Some(syscall::SyscallId::FsFreeSpace) => sc_fs_free_space(),
+        Some(syscall::SyscallId::FsTotalSpace) => sc_fs_total_space(),
+        Some(syscall::SyscallId::FsFileCount) => sc_fs_file_count(),
+        Some(syscall::SyscallId::PathNormalize) => sc_path_normalize(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileTouch) => sc_file_touch(arg0, arg1),
+        Some(syscall::SyscallId::GetFdFlags) => sc_get_fd_flags(arg0),
+        Some(syscall::SyscallId::SetFdFlags) => sc_set_fd_flags(arg0, arg1),
+        Some(syscall::SyscallId::FileDupHandle) => sc_file_dup_handle(arg0),
+        Some(syscall::SyscallId::ProcessSpawn) => sc_process_spawn(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ProcessExit) => sc_process_exit(arg0),
+        Some(syscall::SyscallId::ProcessWait) => sc_process_wait(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ProcessGetPid) => sc_process_get_pid(),
+        Some(syscall::SyscallId::ProcessGetPpid) => sc_process_get_ppid(),
+        Some(syscall::SyscallId::ProcessKill) => sc_process_kill(arg0, arg1),
+        Some(syscall::SyscallId::ProcessList) => sc_process_list(arg0, arg1),
+        Some(syscall::SyscallId::ProcessInfo) => sc_process_info(arg0, arg1),
+        Some(syscall::SyscallId::ProcessName) => sc_process_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ProcessSetName) => sc_process_set_name(arg0, arg1),
+        Some(syscall::SyscallId::ProcessExistsPid) => sc_process_exists_pid(arg0),
+        Some(syscall::SyscallId::ProcessGetState) => sc_process_get_state(arg0),
+        Some(syscall::SyscallId::ProcessGetExit) => sc_process_get_exit(arg0),
+        Some(syscall::SyscallId::ProcessCurrentName) => sc_process_current_name(arg0, arg1),
+        Some(syscall::SyscallId::ProcessArgc) => sc_process_argc(),
+        Some(syscall::SyscallId::ProcessArgv) => sc_process_argv(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ProcessGetEnv) => sc_process_get_env(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ProcessSetEnv) => sc_process_set_env(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ThreadGetTid) => sc_thread_get_tid(),
+        Some(syscall::SyscallId::ThreadYield) => sc_thread_yield(),
+        Some(syscall::SyscallId::ThreadSleepMs) => sc_thread_sleep_ms(arg0),
+        Some(syscall::SyscallId::ThreadSetName) => sc_thread_set_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ThreadGetName) => sc_thread_get_name(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ThreadSetPriority) => sc_thread_set_priority(arg0, arg1),
+        Some(syscall::SyscallId::ThreadGetPriority) => sc_thread_get_priority(arg0),
+        Some(syscall::SyscallId::ProcGetUid) => sc_proc_get_uid(),
+        Some(syscall::SyscallId::ProcSetUid) => sc_proc_set_uid(arg0),
+        Some(syscall::SyscallId::ProcGetGid) => sc_proc_get_gid(),
+        Some(syscall::SyscallId::ProcSetGid) => sc_proc_set_gid(arg0),
+        Some(syscall::SyscallId::ProcTimes) => sc_proc_times(arg0, arg1),
+        Some(syscall::SyscallId::ProcGetCwd) => sc_proc_get_cwd(arg0, arg1),
+        Some(syscall::SyscallId::ProcSetCwd) => sc_proc_set_cwd(arg0, arg1),
+        Some(syscall::SyscallId::ProcExec) => sc_proc_exec(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ProcFork) => sc_proc_fork(),
+        Some(syscall::SyscallId::ProcWaitPid) => sc_proc_waitpid(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ProcIsAlive) => sc_proc_is_alive(arg0),
+        Some(syscall::SyscallId::ProcSignal) => sc_proc_signal(arg0, arg1),
+        Some(syscall::SyscallId::ProcCount) => sc_proc_count(),
+        Some(syscall::SyscallId::ProcMax) => sc_proc_max(),
+        Some(syscall::SyscallId::ProcSelfStatus) => sc_proc_self_status(),
+        Some(syscall::SyscallId::MemAlloc) => sc_mem_alloc(arg0, arg1),
+        Some(syscall::SyscallId::MemFree) => sc_mem_free(arg0, arg1),
+        Some(syscall::SyscallId::MemRealloc) => sc_mem_realloc(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemMap) => sc_mem_map(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemUnmap) => sc_mem_unmap(arg0, arg1),
+        Some(syscall::SyscallId::MemProtect) => sc_mem_protect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemInfo) => sc_mem_info(arg0),
+        Some(syscall::SyscallId::MemStats) => sc_mem_stats(arg0),
+        Some(syscall::SyscallId::MemPageSize) => sc_mem_page_size(),
+        Some(syscall::SyscallId::MemSet) => sc_mem_set(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemCopy) => sc_mem_copy(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemCompare) => sc_mem_compare(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemZero) => sc_mem_zero(arg0, arg1),
+        Some(syscall::SyscallId::MemAvailable) => sc_mem_available(),
+        Some(syscall::SyscallId::MemUsed) => sc_mem_used(),
+        Some(syscall::SyscallId::MemTotal) => sc_mem_total(),
+        Some(syscall::SyscallId::HeapAllocApp) => sc_heap_alloc_app(arg0),
+        Some(syscall::SyscallId::HeapFreeApp) => sc_heap_free_app(arg0, arg1),
+        Some(syscall::SyscallId::HeapStatsApp) => sc_heap_stats_app(arg0),
+        Some(syscall::SyscallId::MemMapShared) => sc_mem_map_shared(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemUnmapShared) => sc_mem_unmap_shared(arg0, arg1),
+        Some(syscall::SyscallId::MemFlush) => sc_mem_flush(arg0, arg1),
+        Some(syscall::SyscallId::MemLock) => sc_mem_lock(arg0, arg1),
+        Some(syscall::SyscallId::MemUnlock) => sc_mem_unlock(arg0, arg1),
+        Some(syscall::SyscallId::MemAdviseApp) => sc_mem_advise_app(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ShmCreate) => sc_shm_create(arg0, arg1),
+        Some(syscall::SyscallId::MmapAnon) => sc_mmap_anon(arg0, arg1),
+        Some(syscall::SyscallId::MunmapAnon) => sc_munmap_anon(arg0, arg1),
+        Some(syscall::SyscallId::MemReadU64) => sc_mem_read_u64(arg0),
+        Some(syscall::SyscallId::MemWriteU64) => sc_mem_write_u64(arg0, arg1),
+        Some(syscall::SyscallId::MemReadU32) => sc_mem_read_u32(arg0),
+        Some(syscall::SyscallId::MemWriteU32) => sc_mem_write_u32(arg0, arg1),
+        Some(syscall::SyscallId::MemSwap) => sc_mem_swap(arg0, arg1, arg2),
+        Some(syscall::SyscallId::MemFillPattern) => sc_mem_fill_pattern(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::MemStatsEx) => sc_mem_stats_ex(arg0),
+        Some(syscall::SyscallId::HeapCompact) => sc_heap_compact(),
+        Some(syscall::SyscallId::MemValidate) => sc_mem_validate(arg0, arg1),
+        Some(syscall::SyscallId::MemDup) => sc_mem_dup(arg0, arg1),
+        Some(syscall::SyscallId::PageAlloc) => sc_page_alloc(arg0),
+        Some(syscall::SyscallId::PageFree) => sc_page_free(arg0, arg1),
+        Some(syscall::SyscallId::TimeNowSec) => sc_time_now_sec(),
+        Some(syscall::SyscallId::TimeNowMs) => sc_time_now_ms(),
+        Some(syscall::SyscallId::TimeNowNs) => sc_time_now_ns(),
+        Some(syscall::SyscallId::TimeMonotonic) => sc_time_monotonic(arg0),
+        Some(syscall::SyscallId::TimeRealtime) => sc_time_realtime(arg0),
+        Some(syscall::SyscallId::TimeSleepNs) => sc_time_sleep_ns(arg0),
+        Some(syscall::SyscallId::TimeSleepMs) => sc_time_sleep_ms(arg0),
+        Some(syscall::SyscallId::TimeSleepSec) => sc_time_sleep_sec(arg0),
+        Some(syscall::SyscallId::TimeTicks) => sc_time_ticks(),
+        Some(syscall::SyscallId::TimeTicksPerSec) => sc_time_ticks_per_sec(),
+        Some(syscall::SyscallId::TimeUptimeMs) => sc_time_uptime_ms(),
+        Some(syscall::SyscallId::TimeDeadline) => sc_time_deadline(arg0),
+        Some(syscall::SyscallId::TimerCreate) => sc_timer_create(arg0, arg1),
+        Some(syscall::SyscallId::TimerGet) => sc_timer_get(arg0),
+        Some(syscall::SyscallId::TimerCancel) => sc_timer_cancel(arg0),
+        Some(syscall::SyscallId::TimerSetMs) => sc_timer_set_ms(arg0, arg1),
+        Some(syscall::SyscallId::TimerRemaining) => sc_timer_remaining(arg0),
+        Some(syscall::SyscallId::ClockGetRes) => sc_clock_get_res(arg0, arg1),
+        Some(syscall::SyscallId::AlarmSet) => sc_alarm_set(arg0),
+        Some(syscall::SyscallId::AlarmCancel) => sc_alarm_cancel(),
+        Some(syscall::SyscallId::IpcMutexCreate) => sc_ipc_mutex_create(),
+        Some(syscall::SyscallId::IpcMutexLock) => sc_ipc_mutex_lock(arg0),
+        Some(syscall::SyscallId::IpcMutexUnlock) => sc_ipc_mutex_unlock(arg0),
+        Some(syscall::SyscallId::IpcMutexDestroy) => sc_ipc_mutex_destroy(arg0),
+        Some(syscall::SyscallId::IpcSemCreate) => sc_ipc_sem_create(arg0),
+        Some(syscall::SyscallId::IpcSemWait) => sc_ipc_sem_wait(arg0),
+        Some(syscall::SyscallId::IpcSemPost) => sc_ipc_sem_post(arg0),
+        Some(syscall::SyscallId::IpcSemDestroy) => sc_ipc_sem_destroy(arg0),
+        Some(syscall::SyscallId::IpcEventCreate) => sc_ipc_event_create(arg0),
+        Some(syscall::SyscallId::IpcEventSignal) => sc_ipc_event_signal(arg0),
+        Some(syscall::SyscallId::IpcEventWait) => sc_ipc_event_wait(arg0, arg1),
+        Some(syscall::SyscallId::IpcMsgCreate) => sc_ipc_msg_create(arg0),
+        Some(syscall::SyscallId::IpcMsgSend) => sc_ipc_msg_send(arg0, arg1, arg2),
+        Some(syscall::SyscallId::IpcMsgRecv) => sc_ipc_msg_recv(arg0, arg1, arg2),
+        Some(syscall::SyscallId::IpcMsgDestroy) => sc_ipc_msg_destroy(arg0),
+        Some(syscall::SyscallId::IpcPipeCreate) => sc_ipc_pipe_create(arg0),
+        Some(syscall::SyscallId::IpcPipeRead) => sc_ipc_pipe_read(arg0, arg1, arg2),
+        Some(syscall::SyscallId::IpcPipeWrite) => sc_ipc_pipe_write(arg0, arg1, arg2),
+        Some(syscall::SyscallId::IpcChannelCreate) => sc_ipc_channel_create(arg0, arg1),
+        Some(syscall::SyscallId::IpcChannelClose) => sc_ipc_channel_close(arg0),
+        Some(syscall::SyscallId::NetSocketCreate) => sc_net_socket_create(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetSocketBind) => sc_net_socket_bind(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetSocketListen) => sc_net_socket_listen(arg0, arg1),
+        Some(syscall::SyscallId::NetSocketAccept) => sc_net_socket_accept(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetSocketConnect) => sc_net_socket_connect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetSocketSend) => sc_net_socket_send(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::NetSocketRecv) => sc_net_socket_recv(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::NetSocketClose) => sc_net_socket_close(arg0),
+        Some(syscall::SyscallId::NetSocketShutdown) => sc_net_socket_shutdown(arg0, arg1),
+        Some(syscall::SyscallId::NetSocketPair) => sc_net_socket_pair(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetGetLocalAddr) => sc_net_get_local_addr(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetGetRemoteAddr) => sc_net_get_remote_addr(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetSetNonBlocking) => sc_net_set_nonblocking(arg0, arg1),
+        Some(syscall::SyscallId::NetPollSocket) => sc_net_poll_socket(arg0, arg1),
+        Some(syscall::SyscallId::NetGetHostName) => sc_net_get_hostname(arg0, arg1),
+        Some(syscall::SyscallId::NetSetHostName) => sc_net_set_hostname(arg0, arg1),
+        Some(syscall::SyscallId::NetResolveLocal) => sc_net_resolve_local(arg0, arg1, arg2),
+        Some(syscall::SyscallId::NetLoopbackPing) => sc_net_loopback_ping(arg0),
+        Some(syscall::SyscallId::NetSocketStats) => sc_net_socket_stats(arg0),
+        Some(syscall::SyscallId::NetIfCount) => sc_net_if_count(),
+        Some(syscall::SyscallId::SysGetOsName) => sc_sys_get_os_name(arg0, arg1),
+        Some(syscall::SyscallId::SysGetOsVersion) => sc_sys_get_os_version(),
+        Some(syscall::SyscallId::SysGetKernelVer) => sc_sys_get_kernel_ver(arg0, arg1),
+        Some(syscall::SyscallId::SysGetArch) => sc_sys_get_arch(),
+        Some(syscall::SyscallId::SysGetCpuCount) => sc_sys_get_cpu_count(),
+        Some(syscall::SyscallId::SysGetCpuFeatures) => sc_sys_get_cpu_features(arg0),
+        Some(syscall::SyscallId::SysGetUptime) => sc_sys_get_uptime(),
+        Some(syscall::SyscallId::SysGetLoadAvg) => sc_sys_get_load_avg(arg0),
+        Some(syscall::SyscallId::SysInfoEx) => sc_sys_info_ex(arg0),
+        Some(syscall::SyscallId::SysGetRandom) => sc_sys_get_random(arg0, arg1),
+        Some(syscall::SyscallId::SysGetBootInfo) => sc_sys_get_boot_info(arg0),
+        Some(syscall::SyscallId::SysGetConsoleSize) => sc_sys_get_console_size(arg0),
+        Some(syscall::SyscallId::SysSetConsoleMode) => sc_sys_set_console_mode(arg0),
+        Some(syscall::SyscallId::SysReboot) => sc_sys_reboot(arg0),
+        Some(syscall::SyscallId::SysShutdown) => sc_sys_shutdown(arg0),
+        Some(syscall::SyscallId::SysDebugLog) => sc_sys_debug_log(arg0, arg1),
+        Some(syscall::SyscallId::SysGetKernelLog) => sc_sys_get_kernel_log(arg0, arg1),
+        Some(syscall::SyscallId::SysGetLastError) => sc_sys_get_last_error(),
+        Some(syscall::SyscallId::SysSetLastError) => sc_sys_set_last_error(arg0),
+        Some(syscall::SyscallId::SysGetAbi) => sc_sys_get_abi(),
+        Some(syscall::SyscallId::KMemAlloc) => sc_kmem_alloc(arg0, arg1),
+        Some(syscall::SyscallId::KMemFree) => sc_kmem_free(arg0, arg1),
+        Some(syscall::SyscallId::KMemMap) => sc_kmem_map(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KMemUnmap) => sc_kmem_unmap(arg0, arg1),
+        Some(syscall::SyscallId::KMemProtect) => sc_kmem_protect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KMemQuery) => sc_kmem_query(arg0, arg1),
+        Some(syscall::SyscallId::KMemStats) => sc_kmem_stats(arg0),
+        Some(syscall::SyscallId::KMemFlush) => sc_kmem_flush(arg0, arg1),
+        Some(syscall::SyscallId::KPageAlloc) => sc_kpage_alloc(arg0),
+        Some(syscall::SyscallId::KPageFree) => sc_kpage_free(arg0, arg1),
+        Some(syscall::SyscallId::KPageMap) => sc_kpage_map(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KPageUnmap) => sc_kpage_unmap(arg0),
+        Some(syscall::SyscallId::KHeapInfo) => sc_kheap_info(arg0),
+        Some(syscall::SyscallId::KHeapCompact) => sc_kheap_compact(),
+        Some(syscall::SyscallId::KMemZero) => sc_kmem_zero(arg0, arg1),
+        Some(syscall::SyscallId::KMemCopy) => sc_kmem_copy(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KMemCompare) => sc_kmem_compare(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KPhysAlloc) => sc_kphys_alloc(arg0),
+        Some(syscall::SyscallId::KPhysFree) => sc_kphys_free(arg0, arg1),
+        Some(syscall::SyscallId::KMemBarrier) => sc_kmem_barrier(),
+        Some(syscall::SyscallId::KSchedYield) => sc_ksched_yield(),
+        Some(syscall::SyscallId::KSchedSetPriority) => sc_ksched_set_priority(arg0, arg1),
+        Some(syscall::SyscallId::KSchedGetPriority) => sc_ksched_get_priority(arg0),
+        Some(syscall::SyscallId::KThreadCreate) => sc_kthread_create(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KThreadExit) => sc_kthread_exit(arg0),
+        Some(syscall::SyscallId::KThreadJoin) => sc_kthread_join(arg0, arg1),
+        Some(syscall::SyscallId::KThreadSleep) => sc_kthread_sleep(arg0),
+        Some(syscall::SyscallId::KThreadWake) => sc_kthread_wake(arg0),
+        Some(syscall::SyscallId::KProcessCreate) => sc_kprocess_create(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::KProcessExit) => sc_kprocess_exit(arg0),
+        Some(syscall::SyscallId::KProcessKill) => sc_kprocess_kill(arg0, arg1),
+        Some(syscall::SyscallId::KProcessWait) => sc_kprocess_wait(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KProcessInfo) => sc_kprocess_info(arg0, arg1),
+        Some(syscall::SyscallId::KProcessList) => sc_kprocess_list(arg0, arg1),
+        Some(syscall::SyscallId::KTaskSwitch) => sc_ktask_switch(),
+        Some(syscall::SyscallId::KSetAffinity) => sc_kset_affinity(arg0, arg1),
+        Some(syscall::SyscallId::KGetAffinity) => sc_kget_affinity(arg0),
+        Some(syscall::SyscallId::KCpuId) => sc_kcpu_id(),
+        Some(syscall::SyscallId::KIrqDisable) => sc_kirq_disable(),
+        Some(syscall::SyscallId::KIrqEnable) => sc_kirq_enable(),
+        Some(syscall::SyscallId::KDevList) => sc_kdev_list(arg0, arg1),
+        Some(syscall::SyscallId::KDevOpen) => sc_kdev_open(arg0, arg1),
+        Some(syscall::SyscallId::KDevClose) => sc_kdev_close(arg0),
+        Some(syscall::SyscallId::KDevRead) => sc_kdev_read(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KDevWrite) => sc_kdev_write(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KDevIoctl) => sc_kdev_ioctl(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KDevPoll) => sc_kdev_poll(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KDevMmap) => sc_kdev_mmap(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::KDevIrqRegister) => sc_kdev_irq_register(arg0, arg1),
+        Some(syscall::SyscallId::KDevIrqUnregister) => sc_kdev_irq_unregister(arg0),
+        Some(syscall::SyscallId::KDevDmaAlloc) => sc_kdev_dma_alloc(arg0, arg1),
+        Some(syscall::SyscallId::KDevDmaFree) => sc_kdev_dma_free(arg0, arg1),
+        Some(syscall::SyscallId::KIoPortRead) => sc_kio_port_read(arg0, arg1),
+        Some(syscall::SyscallId::KIoPortWrite) => sc_kio_port_write(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KFbGetInfo) => sc_kfb_get_info(arg0),
+        Some(syscall::SyscallId::KFbPutPixel) => sc_kfb_put_pixel(arg0, arg1, arg2, arg3, arg4),
+        Some(syscall::SyscallId::KFbClear) => sc_kfb_clear(arg0, arg1, arg2),
+        Some(syscall::SyscallId::KInputPoll) => sc_kinput_poll(arg0),
+        Some(syscall::SyscallId::KInputRead) => sc_kinput_read(arg0),
+        Some(syscall::SyscallId::KConsoleWrite) => sc_kconsole_write(arg0, arg1),
+        Some(syscall::SyscallId::KSecGetUid) => sc_ksec_get_uid(),
+        Some(syscall::SyscallId::KSecSetUid) => sc_ksec_set_uid(arg0),
+        Some(syscall::SyscallId::KSecGetGid) => sc_ksec_get_gid(),
+        Some(syscall::SyscallId::KSecSetGid) => sc_ksec_set_gid(arg0),
+        Some(syscall::SyscallId::KSecDropPrivs) => sc_ksec_drop_privs(),
+        Some(syscall::SyscallId::KSecGetCaps) => sc_ksec_get_caps(),
+        Some(syscall::SyscallId::KSecSetCaps) => sc_ksec_set_caps(arg0),
+        Some(syscall::SyscallId::KObjCreate) => sc_kobj_create(arg0, arg1),
+        Some(syscall::SyscallId::KObjClose) => sc_kobj_close(arg0),
+        Some(syscall::SyscallId::KObjDup) => sc_kobj_dup(arg0),
+        Some(syscall::SyscallId::KObjRef) => sc_kobj_ref(arg0),
+        Some(syscall::SyscallId::KObjUnref) => sc_kobj_unref(arg0),
+        Some(syscall::SyscallId::KObjGetType) => sc_kobj_get_type(arg0),
+        Some(syscall::SyscallId::KSignalSend) => sc_ksignal_send(arg0, arg1),
+        Some(syscall::SyscallId::KSignalMask) => sc_ksignal_mask(arg0, arg1),
+        Some(syscall::SyscallId::KSignalWait) => sc_ksignal_wait(arg0),
+        Some(syscall::SyscallId::KEventCreate) => sc_kevent_create(arg0),
+        Some(syscall::SyscallId::KEventSignal) => sc_kevent_signal(arg0),
+        Some(syscall::SyscallId::KEventWait) => sc_kevent_wait(arg0, arg1),
+        Some(syscall::SyscallId::KEventReset) => sc_kevent_reset(arg0),
+        Some(syscall::SyscallId::KBootGetInfo) => sc_kboot_get_info(arg0),
+        Some(syscall::SyscallId::KBootGetCmdline) => sc_kboot_get_cmdline(arg0, arg1),
+        Some(syscall::SyscallId::KBootGetModules) => sc_kboot_get_modules(arg0),
+        Some(syscall::SyscallId::KDebugLogWrite) => sc_kdebug_log_write(arg0, arg1),
+        Some(syscall::SyscallId::KDebugLogRead) => sc_kdebug_log_read(arg0, arg1),
+        Some(syscall::SyscallId::KDebugBreakpoint) => sc_kdebug_breakpoint(),
+        Some(syscall::SyscallId::KDebugDumpRegs) => sc_kdebug_dump_regs(arg0),
+        Some(syscall::SyscallId::KDebugTrace) => sc_kdebug_trace(arg0, arg1),
+        Some(syscall::SyscallId::KPanic) => sc_kpanic(arg0, arg1),
+        Some(syscall::SyscallId::KGetVersion) => sc_kget_version(),
+        Some(syscall::SyscallId::KGetBuildInfo) => sc_kget_build_info(arg0, arg1),
+        Some(syscall::SyscallId::KGetUptime) => sc_kget_uptime(),
+        Some(syscall::SyscallId::KGetTicks) => sc_kget_ticks(),
+        Some(syscall::SyscallId::KCpuCount) => sc_kcpu_count(),
+        Some(syscall::SyscallId::KCpuFeatures) => sc_kcpu_features(arg0),
+        Some(syscall::SyscallId::KPowerReboot) => sc_kpower_reboot(arg0),
+        Some(syscall::SyscallId::KPowerShutdown) => sc_kpower_shutdown(arg0),
+        Some(syscall::SyscallId::KPowerSuspend) => sc_kpower_suspend(arg0),
+        Some(syscall::SyscallId::KSyscallCount) => sc_ksyscall_count(),
+        Some(syscall::SyscallId::KMilestoneCheck) => sc_kmilestone_check(),
         Some(_) => syscall_error(syscall::ENOSYS),
         None => syscall_error(syscall::ENOSYS),
     }
