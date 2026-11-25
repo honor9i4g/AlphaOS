@@ -18,6 +18,7 @@ pub const ENOENT: u64 = 2;
 pub const ESRCH: u64 = 3;
 pub const EIO: u64 = 5;
 pub const EBADF: u64 = 9;
+pub const ENOEXEC: u64 = 8;
 pub const ECHILD: u64 = 10;
 pub const EAGAIN: u64 = 11;
 pub const ENOMEM: u64 = 12;

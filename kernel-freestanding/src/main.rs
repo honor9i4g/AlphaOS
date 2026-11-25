@@ -51,6 +51,12 @@ const USER_INPUT_TARGET: u64 = 1;
 struct KernelSyscallStack([u8; 16 * 1024]);
 
 static mut KERNEL_SYSCALL_STACK: KernelSyscallStack = KernelSyscallStack([0; 16 * 1024]);
+#[repr(C, align(16))]
+struct KernelResumeStack([u8; 16 * 1024]);
+static mut KERNEL_RESUME_STACK: KernelResumeStack = KernelResumeStack([0; 16 * 1024]);
+#[used]
+#[unsafe(no_mangle)]
+static mut KERNEL_RESUME_STACK_TOP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SYSCALL_KERNEL_STACK_TOP: u64 = 0;
 #[used]
@@ -59,6 +65,9 @@ static mut SYSCALL_USER_STACK: u64 = 0;
 #[used]
 #[unsafe(no_mangle)]
 static mut SYSCALL_SAVED_RAX: u64 = 0;
+#[used]
+#[unsafe(no_mangle)]
+static mut KERNEL_RESUME_RSP: u64 = 0;
 static mut SYSCALL_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut HHDM_OFFSET: u64 = 0;
 static mut ALLOCATOR_START: u64 = 0;
@@ -220,6 +229,8 @@ struct SpawnedProc {
     pid: u64,
     exited: bool,
     exit_code: u64,
+    ready: bool,
+    entry: u64,
 }
 
 impl SpawnedProc {
@@ -229,6 +240,8 @@ impl SpawnedProc {
             pid: 0,
             exited: false,
             exit_code: 0,
+            ready: false,
+            entry: 0,
         }
     }
 }
@@ -239,6 +252,7 @@ static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = [OpenFile::empty(); MAX_OPEN
 static mut HEAP_BLOCKS: [HeapBlock; MAX_HEAP_BLOCKS] = [HeapBlock::empty(); MAX_HEAP_BLOCKS];
 static mut SPAWNED: [SpawnedProc; MAX_SPAWNED] = [SpawnedProc::empty(); MAX_SPAWNED];
 static NEXT_SPAWN_PID: AtomicU64 = AtomicU64::new(2);
+static CURRENT_PID: AtomicU64 = AtomicU64::new(0);
 static EXIT_STATUS: AtomicU64 = AtomicU64::new(0);
 static EXITED: AtomicU8 = AtomicU8::new(0);
 
@@ -389,6 +403,48 @@ global_asm!(
     "push 0x23",
     "push rax",
     "iretq",
+    ".global run_user_with_resume",
+    "run_user_with_resume:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov qword ptr [rip + KERNEL_RESUME_RSP], rsp",
+    "mov ax, 0x1b",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov rax, rdi",
+    "mov rbx, rsi",
+    "push 0x1b",
+    "push rbx",
+    "push 0x202",
+    "push 0x23",
+    "push rax",
+    "iretq",
+    ".global start_kernel_on_resume_stack",
+    "start_kernel_on_resume_stack:",
+    "mov rsp, qword ptr [rip + KERNEL_RESUME_STACK_TOP]",
+    "xor rbp, rbp",
+    "call kernel_run_loop",
+    "1: hlt",
+    "jmp 1b",
+    ".global kernel_exit_resume",
+    "kernel_exit_resume:",
+    "cli",
+    "mov ax, 0x10",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov ss, ax",
+    "mov rsp, qword ptr [rip + KERNEL_RESUME_RSP]",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
+    "ret",
     ".global syscall_entry",
     "syscall_entry:",
     "mov qword ptr [rip + SYSCALL_USER_STACK], rsp",
@@ -567,6 +623,9 @@ global_asm!(
 
 unsafe extern "C" {
     fn enter_user_mode(instruction_pointer: u64, stack_pointer: u64) -> !;
+    fn run_user_with_resume(instruction_pointer: u64, stack_pointer: u64);
+    fn kernel_exit_resume() -> !;
+    fn start_kernel_on_resume_stack() -> !;
     fn syscall_entry();
     static user_test_start: u8;
     static user_test_end: u8;
@@ -629,6 +688,10 @@ extern "C" fn kmain() -> ! {
             .cast::<u8>()
             .add(16 * 1024) as u64;
         core::ptr::addr_of_mut!(SYSCALL_KERNEL_STACK_TOP).write_volatile(stack_top);
+        let resume_top = core::ptr::addr_of_mut!(KERNEL_RESUME_STACK.0)
+            .cast::<u8>()
+            .add(16 * 1024) as u64;
+        core::ptr::addr_of_mut!(KERNEL_RESUME_STACK_TOP).write_volatile(resume_top);
         BOOT_TSC = read_tsc();
         CWD_BUF[0] = b'/';
         CWD_LEN = 1;
@@ -652,14 +715,54 @@ extern "C" fn kmain() -> ! {
         );
         halt();
     }
-    if !map_user_test_program() {
-        halt();
-    }
     input::set_foreground_target(Some(USER_INPUT_TARGET));
     interrupts::enable_keyboard_irq();
-
     unsafe {
-        enter_user_mode(USER_CODE_BASE, USER_STACK_TOP);
+        start_kernel_on_resume_stack();
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn kernel_run_loop() {
+    loop {
+        let mut found: Option<(usize, u64, u64)> = None;
+        lock_kernel();
+        unsafe {
+            for i in 0..MAX_SPAWNED {
+                if SPAWNED[i].used && SPAWNED[i].ready && !SPAWNED[i].exited {
+                    found = Some((i, SPAWNED[i].pid, SPAWNED[i].entry));
+                    SPAWNED[i].ready = false;
+                    break;
+                }
+            }
+        }
+        unlock_kernel();
+
+        if let Some((_slot, pid, entry)) = found {
+            CURRENT_PID.store(pid, Ordering::Relaxed);
+            EXITED.store(0, Ordering::Relaxed);
+            EXIT_STATUS.store(0, Ordering::Relaxed);
+            configure_syscall_entry();
+            unsafe { run_user_with_resume(entry, USER_STACK_TOP); }
+            let exit_code = EXIT_STATUS.load(Ordering::Relaxed);
+            lock_kernel();
+            unsafe {
+                for i in 0..MAX_SPAWNED {
+                    if SPAWNED[i].used && SPAWNED[i].pid == pid {
+                        if !SPAWNED[i].ready && !SPAWNED[i].exited {
+                            SPAWNED[i].exited = true;
+                            SPAWNED[i].exit_code = exit_code;
+                        }
+                    }
+                }
+            }
+            if !unsafe { (0..MAX_SPAWNED).any(|i| SPAWNED[i].used && SPAWNED[i].pid == pid && SPAWNED[i].ready) } {
+                CURRENT_PID.store(0, Ordering::Relaxed);
+            }
+            unlock_kernel();
+        } else {
+            unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)); }
+        }
     }
 }
 
@@ -919,6 +1022,134 @@ unsafe fn write_msr(register: u32, value: u64) {
             options(nomem, nostack, preserves_flags)
         );
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+const ET_EXEC: u16 = 2;
+const EM_X86_64: u16 = 62;
+const PT_LOAD: u32 = 1;
+
+fn page_table_root() -> u64 {
+    unsafe {
+        let value: u64;
+        asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
+        value & 0x000F_FFFF_FFFF_F000
+    }
+}
+
+unsafe fn map_user_page(va: u64, phys: u64) -> bool {
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let root = page_table_root();
+    let Some(root_va) = root.checked_add(hhdm) else { return false; };
+    let pml4 = root_va as *mut u64;
+    let idx4 = ((va >> 39) & 0x1FF) as usize;
+    let idx3 = ((va >> 30) & 0x1FF) as usize;
+    let idx2 = ((va >> 21) & 0x1FF) as usize;
+    let idx1 = ((va >> 12) & 0x1FF) as usize;
+
+    unsafe fn ensure_table(entry_ptr: *mut u64, hhdm: u64) -> Option<*mut u64> {
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if entry & 1 != 0 {
+            let phys = entry & 0x000F_FFFF_FFFF_F000;
+            return Some((phys + hhdm) as *mut u64);
+        }
+        let (phys, virt) = unsafe { allocate_page()? };
+        unsafe { entry_ptr.write_volatile(phys | 0x7); }
+        Some(virt as *mut u64)
+    }
+
+    let Some(pdpt) = (unsafe { ensure_table(pml4.add(idx4), hhdm) }) else { return false; };
+    let Some(pd) = (unsafe { ensure_table(pdpt.add(idx3), hhdm) }) else { return false; };
+    let Some(pt) = (unsafe { ensure_table(pd.add(idx2), hhdm) }) else { return false; };
+    unsafe { pt.add(idx1).write_volatile((phys & 0x000F_FFFF_FFFF_F000) | 0x7); }
+    unsafe { asm!("invlpg [{}]", in(reg) va as usize, options(nostack, preserves_flags)); }
+    true
+}
+
+fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
+    init_fs();
+    let Some(idx) = fs_find(path) else { return Err(syscall::ENOENT); };
+    let (size, data_ptr) = unsafe { (FS_FILES[idx].size, FS_FILES[idx].data.as_ptr()) };
+    if size < core::mem::size_of::<Elf64Ehdr>() { return Err(syscall::ENOEXEC); }
+    let ehdr = unsafe { core::ptr::read_unaligned(data_ptr as *const Elf64Ehdr) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC || ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
+        return Err(syscall::ENOEXEC);
+    }
+    if ehdr.e_type != ET_EXEC || ehdr.e_machine != EM_X86_64 { return Err(syscall::ENOEXEC); }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() { return Err(syscall::ENOEXEC); }
+    let phoff = ehdr.e_phoff as usize;
+    let phnum = ehdr.e_phnum as usize;
+    let phsz = core::mem::size_of::<Elf64Phdr>();
+    if phoff.checked_add(phnum.saturating_mul(phsz)).unwrap_or(usize::MAX) > size { return Err(syscall::ENOEXEC); }
+
+    for i in 0..phnum {
+        let ph = unsafe { core::ptr::read_unaligned(data_ptr.add(phoff + i * phsz) as *const Elf64Phdr) };
+        if ph.p_type != PT_LOAD { continue; }
+        if ph.p_memsz == 0 { continue; }
+        if ph.p_filesz > ph.p_memsz { return Err(syscall::ENOEXEC); }
+        let seg_start = ph.p_vaddr & !0xFFF;
+        let seg_end = match ph.p_vaddr.checked_add(ph.p_memsz) { Some(v) => (v + 0xFFF) & !0xFFF, None => return Err(syscall::ENOEXEC) };
+        if seg_start < USER_CODE_BASE || seg_end > USER_REGION_END { return Err(syscall::EFAULT); }
+        let mut va = seg_start;
+        while va < seg_end {
+            let Some((phys, virt)) = (unsafe { allocate_page() }) else { return Err(syscall::ENOMEM); };
+            let _ = virt;
+            if !unsafe { map_user_page(va, phys) } { return Err(syscall::ENOMEM); }
+            let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+            let dst = (phys + hhdm) as *mut u8;
+            unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE as usize); }
+            let page_off = va.saturating_sub(ph.p_vaddr);
+            for b in 0..PAGE_SIZE as usize {
+                let file_off = page_off as usize + b;
+                if file_off < ph.p_filesz as usize {
+                    let src_off = ph.p_offset as usize + file_off;
+                    if src_off < size {
+                        unsafe { core::ptr::write(dst.add(b), *data_ptr.add(src_off)); }
+                    }
+                }
+            }
+            va += PAGE_SIZE;
+        }
+    }
+    Ok(ehdr.e_entry)
+}
+
+fn try_exec_user_program(path: &[u8]) -> Result<u64, u64> {
+    let entry = load_user_elf(path)?;
+    configure_syscall_entry();
+    Ok(entry)
 }
 
 #[unsafe(no_mangle)]
@@ -1489,10 +1720,62 @@ fn syscall_get_process_name2(pid: u64, buf_ptr: u64, buf_len: u64) -> syscall::S
     match sc_copy_cstr_to_user(buf_ptr, buf_len, &tmp[..n]) { Ok(v)=>syscall::SyscallResult::success(v), Err(e)=>{sc_set_last_error(e); syscall_error(e)} }
 }
 fn syscall_fork() -> syscall::SyscallResult { sc_set_last_error(syscall::ENOTSUP); syscall_error(syscall::ENOTSUP) }
-fn syscall_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, flags: u64) -> syscall::SyscallResult {
-    // freestanding single-process model: exec behaves as spawn+immediate success; stores name
-    let r = sys_spawn(path_ptr, path_len, argv_ptr, flags);
-    r
+fn syscall_exec(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> syscall::SyscallResult {
+    init_fs();
+    let mut path_buf = [0u8; 64];
+    let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    let path = &path_buf[..n];
+    let entry = match load_user_elf(path) {
+        Ok(e) => e,
+        Err(err) => return syscall_error(err),
+    };
+
+    let current_pid = CURRENT_PID.load(Ordering::Relaxed);
+    lock_kernel();
+    let mut slot = None;
+    if current_pid != 0 {
+        for i in 0..MAX_SPAWNED {
+            if unsafe { SPAWNED[i].used && SPAWNED[i].pid == current_pid } {
+                slot = Some(i);
+                break;
+            }
+        }
+    }
+    if slot.is_none() {
+        for i in 0..MAX_SPAWNED {
+            if unsafe { !SPAWNED[i].used } {
+                slot = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(slot) = slot else {
+        unlock_kernel();
+        return syscall_error(syscall::EAGAIN);
+    };
+
+    let pid = if current_pid != 0 { current_pid } else { NEXT_SPAWN_PID.fetch_add(1, Ordering::Relaxed) };
+    unsafe {
+        SPAWNED[slot] = SpawnedProc {
+            used: true,
+            pid,
+            exited: false,
+            exit_code: 0,
+            ready: true,
+            entry,
+        };
+        let name_len = core::cmp::min(n, MAX_PROC_NAME);
+        PROC_NAMES[slot][..name_len].copy_from_slice(&path_buf[..name_len]);
+        PROC_NAME_LENS[slot] = name_len;
+    }
+    unlock_kernel();
+
+    if current_pid != 0 {
+        unsafe { kernel_exit_resume(); }
+    }
+    syscall::SyscallResult { value: pid, error: 0 }
 }
 fn syscall_waitpid(pid: u64, status_ptr: u64, options: u64) -> syscall::SyscallResult { sys_wait(pid, status_ptr, options) }
 fn syscall_get_exit_code(pid: u64) -> syscall::SyscallResult {
@@ -4558,11 +4841,21 @@ fn fs_create(name: &[u8], is_dir: bool) -> Option<usize> {
 fn sys_exit(status: u64) -> syscall::SyscallResult {
     EXIT_STATUS.store(status, Ordering::Relaxed);
     EXITED.store(1, Ordering::Relaxed);
-    loop {
+    let pid = CURRENT_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        lock_kernel();
         unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
+            for i in 0..MAX_SPAWNED {
+                if SPAWNED[i].used && SPAWNED[i].pid == pid {
+                    SPAWNED[i].exited = true;
+                    SPAWNED[i].exit_code = status;
+                }
+            }
         }
+        CURRENT_PID.store(0, Ordering::Relaxed);
+        unlock_kernel();
     }
+    unsafe { kernel_exit_resume(); }
 }
 
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64, _mode: u64) -> syscall::SyscallResult {
@@ -5011,10 +5304,17 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
     let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
         return syscall_error(syscall::EFAULT);
     };
-    // Accept spawn for any valid path in single-process freestanding kernel.
-    if fs_find(&path_buf[..n]).is_none() {
-        let _ = fs_create(&path_buf[..n], false);
+    let path = &path_buf[..n];
+
+    if CURRENT_PID.load(Ordering::Relaxed) != 0 {
+        return syscall_error(syscall::ENOTSUP);
     }
+
+    let entry = match load_user_elf(path) {
+        Ok(e) => e,
+        Err(err) => return syscall_error(err),
+    };
+
     lock_kernel();
     let mut slot = None;
     for i in 0..MAX_SPAWNED {
@@ -5032,12 +5332,17 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
         SPAWNED[slot] = SpawnedProc {
             used: true,
             pid,
-            exited: true,
+            exited: false,
             exit_code: 0,
+            ready: true,
+            entry,
         };
+        let name_len = core::cmp::min(n, MAX_PROC_NAME);
+        PROC_NAMES[slot][..name_len].copy_from_slice(&path_buf[..name_len]);
+        PROC_NAME_LENS[slot] = name_len;
     }
     unlock_kernel();
-    // Single-process freestanding kernel: spawn records a completed child process entry.
+
     syscall::SyscallResult {
         value: pid,
         error: 0,
