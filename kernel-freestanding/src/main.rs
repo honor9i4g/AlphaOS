@@ -11,7 +11,7 @@ mod ps2;
 
 use alphaos_syscall_abi as syscall;
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use limine::BaseRevision;
 use limine::framebuffer::MemoryModel;
 use limine::memory_map::EntryType;
@@ -65,6 +65,209 @@ static mut ALLOCATOR_START: u64 = 0;
 static mut ALLOCATOR_NEXT: u64 = 0;
 static mut ALLOCATOR_END: u64 = 0;
 static OPENED_DEVICE_IDS: AtomicU32 = AtomicU32::new(0);
+static PROCESS_PRIORITY: AtomicI32 = AtomicI32::new(0);
+static USER_HEAP_NEXT: AtomicU64 = AtomicU64::new(USER_REGION_END);
+
+const HANDLE_KIND_PIPE_R: u32 = 0x10;
+const HANDLE_KIND_PIPE_W: u32 = 0x11;
+const HANDLE_KIND_CHANNEL: u32 = 0x20;
+const HANDLE_KIND_SOCKET: u32 = 0x30;
+const HANDLE_KIND_FILE: u32 = 0x40;
+const MAX_PIPES: usize = 8;
+const PIPE_BUF_SIZE: usize = 512;
+const MAX_CHANNELS: usize = 8;
+const CHANNEL_BUF_SIZE: usize = 512;
+const MAX_SOCKETS: usize = 8;
+const MAX_FS_FILES: usize = 16;
+const MAX_FILE_SIZE: usize = 1024;
+const MAX_OPEN_FILES: usize = 16;
+const MAX_SPAWNED: usize = 8;
+const MAX_HEAP_BLOCKS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct PipeSlot {
+    used: bool,
+    read_open: bool,
+    write_open: bool,
+    head: usize,
+    len: usize,
+    buf: [u8; PIPE_BUF_SIZE],
+}
+
+impl PipeSlot {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            read_open: false,
+            write_open: false,
+            head: 0,
+            len: 0,
+            buf: [0; PIPE_BUF_SIZE],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ChannelSlot {
+    used: bool,
+    head: usize,
+    len: usize,
+    buf: [u8; CHANNEL_BUF_SIZE],
+}
+
+impl ChannelSlot {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            head: 0,
+            len: 0,
+            buf: [0; CHANNEL_BUF_SIZE],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SocketSlot {
+    used: bool,
+    domain: u32,
+    socket_type: u32,
+    protocol: u32,
+    bound: bool,
+    listening: bool,
+    connected: bool,
+}
+
+impl SocketSlot {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            domain: 0,
+            socket_type: 0,
+            protocol: 0,
+            bound: false,
+            listening: false,
+            connected: false,
+        }
+    }
+}
+
+static mut PIPES: [PipeSlot; MAX_PIPES] = [PipeSlot::empty(); MAX_PIPES];
+static mut CHANNELS: [ChannelSlot; MAX_CHANNELS] = [ChannelSlot::empty(); MAX_CHANNELS];
+static mut SOCKETS: [SocketSlot; MAX_SOCKETS] = [SocketSlot::empty(); MAX_SOCKETS];
+
+#[derive(Clone, Copy)]
+struct FsFile {
+    used: bool,
+    is_dir: bool,
+    name: [u8; 64],
+    name_len: usize,
+    data: [u8; MAX_FILE_SIZE],
+    size: usize,
+}
+
+impl FsFile {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            is_dir: false,
+            name: [0; 64],
+            name_len: 0,
+            data: [0; MAX_FILE_SIZE],
+            size: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OpenFile {
+    used: bool,
+    fs_index: usize,
+    offset: usize,
+    flags: u32,
+}
+
+impl OpenFile {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            fs_index: 0,
+            offset: 0,
+            flags: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeapBlock {
+    used: bool,
+    addr: u64,
+    size: u64,
+}
+
+impl HeapBlock {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            addr: 0,
+            size: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SpawnedProc {
+    used: bool,
+    pid: u64,
+    exited: bool,
+    exit_code: u64,
+}
+
+impl SpawnedProc {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            pid: 0,
+            exited: false,
+            exit_code: 0,
+        }
+    }
+}
+
+static mut FS_FILES: [FsFile; MAX_FS_FILES] = [FsFile::empty(); MAX_FS_FILES];
+static mut FS_INIT: bool = false;
+static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = [OpenFile::empty(); MAX_OPEN_FILES];
+static mut HEAP_BLOCKS: [HeapBlock; MAX_HEAP_BLOCKS] = [HeapBlock::empty(); MAX_HEAP_BLOCKS];
+static mut SPAWNED: [SpawnedProc; MAX_SPAWNED] = [SpawnedProc::empty(); MAX_SPAWNED];
+static NEXT_SPAWN_PID: AtomicU64 = AtomicU64::new(2);
+static EXIT_STATUS: AtomicU64 = AtomicU64::new(0);
+static EXITED: AtomicU8 = AtomicU8::new(0);
+
+static KERNEL_LOCK: AtomicU8 = AtomicU8::new(0);
+
+fn lock_kernel() {
+    while KERNEL_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn unlock_kernel() {
+    KERNEL_LOCK.store(0, Ordering::Release);
+}
+
+fn make_handle(kind: u32, slot: u32) -> u64 {
+    (u64::from(kind) << 32) | u64::from(slot)
+}
+
+fn handle_kind(handle: u64) -> u32 {
+    (handle >> 32) as u32
+}
+
+fn handle_slot(handle: u64) -> usize {
+    (handle & u64::from(u32::MAX)) as usize
+}
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -332,7 +535,7 @@ extern "C" fn kmain() -> ! {
 
     clear_screen(address, width, height, pitch, pixel_format);
     if syscall::SYSCALLS.len() != syscall::SYSCALL_COUNT
-        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0003
+        || syscall::dispatch(syscall::SyscallId::GetAbiVersion as u64, [0; 6]).value != 0x0001_0004
     {
         halt();
     }
@@ -638,31 +841,97 @@ extern "C" fn syscall_dispatch(
     arg0: u64,
     arg1: u64,
     arg2: u64,
-    _arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
 ) -> syscall::SyscallResult {
-    let result = match syscall::syscall_info(number).map(|info| info.id) {
+    match syscall::syscall_info(number).map(|info| info.id) {
+        Some(syscall::SyscallId::Exit) => sys_exit(arg0),
+        Some(syscall::SyscallId::Open) => sys_open(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::FileRead) => sys_file_read(arg0, arg1, arg2),
+        Some(syscall::SyscallId::FileWrite) => sys_file_write(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Seek) => sys_seek(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Stat) => sys_stat(arg0, arg1, arg2),
+        Some(syscall::SyscallId::ReadDir) => sys_readdir(arg0, arg1),
+        Some(syscall::SyscallId::MapMemory) => sys_map_memory(arg0, arg1, arg2, arg3, arg4),
+        Some(syscall::SyscallId::UnmapMemory) => sys_unmap_memory(arg0, arg1),
+        Some(syscall::SyscallId::HeapAlloc) => sys_heap_alloc(arg0, arg1),
+        Some(syscall::SyscallId::HeapFree) => sys_heap_free(arg0, arg1),
+        Some(syscall::SyscallId::ClockGetTime) => sys_clock_gettime(arg0, arg1),
+        Some(syscall::SyscallId::Sleep) => sys_sleep(arg0),
+        Some(syscall::SyscallId::Spawn) => sys_spawn(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::Wait) => sys_wait(arg0, arg1, arg2),
+        Some(syscall::SyscallId::DeviceControl) => {
+            sys_device_control(arg0, arg1, arg2, arg3, arg4, arg5)
+        }
         Some(syscall::SyscallId::GetAbiVersion) => syscall::SyscallResult {
             value: (u64::from(syscall::SYSCALL_ABI_MAJOR) << 16)
                 | u64::from(syscall::SYSCALL_ABI_MINOR),
             error: 0,
         },
         Some(syscall::SyscallId::GetPid) => syscall::SyscallResult { value: 1, error: 0 },
-        Some(syscall::SyscallId::Read) => read_console(arg0, arg1, arg2),
-        Some(syscall::SyscallId::Write) => write_console(arg0, arg1, arg2),
-        Some(syscall::SyscallId::Close) => close_device(arg0),
+        Some(syscall::SyscallId::Read) => {
+            if handle_kind(arg0) == HANDLE_KIND_PIPE_R {
+                let slot = handle_slot(arg0);
+                let Ok(len) = usize::try_from(arg2) else {
+                    return syscall_error(syscall::EINVAL);
+                };
+                if len != 0 && !valid_user_range(arg1, len) {
+                    return syscall_error(syscall::EFAULT);
+                }
+                pipe_read(slot, arg1, len)
+            } else {
+                read_console(arg0, arg1, arg2)
+            }
+        }
+        Some(syscall::SyscallId::Write) => {
+            if handle_kind(arg0) == HANDLE_KIND_PIPE_W {
+                let slot = handle_slot(arg0);
+                let Ok(len) = usize::try_from(arg2) else {
+                    return syscall_error(syscall::EINVAL);
+                };
+                if len != 0 && !valid_user_range(arg1, len) {
+                    return syscall_error(syscall::EFAULT);
+                }
+                pipe_write(slot, arg1, len)
+            } else {
+                write_console(arg0, arg1, arg2)
+            }
+        }
+        Some(syscall::SyscallId::Close) => close_handle(arg0),
         Some(syscall::SyscallId::DeviceList) => device_list(arg0, arg1),
         Some(syscall::SyscallId::DeviceOpen) => device_open(arg0, arg1),
         Some(syscall::SyscallId::DeviceRead) => device_read(arg0, arg1, arg2),
         Some(syscall::SyscallId::DeviceWrite) => device_write(arg0, arg1, arg2),
         Some(syscall::SyscallId::GetSystemInfo) => get_system_info(arg0, arg1, arg2),
-        _ => syscall::SyscallResult {
-            value: u64::MAX,
-            error: syscall::ENOSYS,
-        },
-    };
-    result
+        Some(syscall::SyscallId::Yield) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::GetTid) => syscall::SyscallResult { value: 1, error: 0 },
+        Some(syscall::SyscallId::GetPpid) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::GetUid) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::GetGid) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::SetPriority) => set_priority(arg0, arg1),
+        Some(syscall::SyscallId::GetPriority) => get_priority(arg0),
+        Some(syscall::SyscallId::VirtualAlloc) => virtual_alloc(arg0, arg1, arg2),
+        Some(syscall::SyscallId::VirtualFree) => virtual_free(arg0, arg1),
+        Some(syscall::SyscallId::VirtualProtect) => virtual_protect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Truncate) => truncate_handle(arg0, arg1),
+        Some(syscall::SyscallId::Fstat) => fstat_handle(arg0, arg1),
+        Some(syscall::SyscallId::Sync) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::Pipe) => pipe_create(arg0),
+        Some(syscall::SyscallId::SocketCreate) => socket_create(arg0, arg1, arg2),
+        Some(syscall::SyscallId::SocketBind) => socket_bind(arg0, arg1, arg2),
+        Some(syscall::SyscallId::SocketListen) => socket_listen(arg0, arg1),
+        Some(syscall::SyscallId::SocketAccept) => socket_accept(arg0, arg1, arg2),
+        Some(syscall::SyscallId::SocketConnect) => socket_connect(arg0, arg1, arg2),
+        Some(syscall::SyscallId::Reboot) => reboot_system(arg0),
+        Some(syscall::SyscallId::ChannelPairCreate) => channel_pair_create(arg0, arg1),
+        Some(syscall::SyscallId::ChannelSend) => channel_send(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ChannelReceive) => channel_receive(arg0, arg1, arg2, arg3),
+        Some(syscall::SyscallId::ChannelClose) => channel_close(arg0),
+        Some(syscall::SyscallId::SharedMemoryCreate) => shared_memory_create(arg0, arg1),
+        Some(_) => syscall_error(syscall::ENOSYS),
+        None => syscall_error(syscall::ENOSYS),
+    }
 }
 
 fn device_list(entries: u64, capacity: u64) -> syscall::SyscallResult {
@@ -742,11 +1011,32 @@ fn device_read(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult 
     read_input_event(buffer, length)
 }
 
-fn close_device(handle: u64) -> syscall::SyscallResult {
-    let Some((device_id, _)) = decode_device_handle(handle) else {
+fn close_handle(handle: u64) -> syscall::SyscallResult {
+    let kind = handle_kind(handle);
+    match kind {
+        HANDLE_KIND_PIPE_R | HANDLE_KIND_PIPE_W => close_pipe_handle(handle),
+        HANDLE_KIND_CHANNEL => channel_close(handle),
+        HANDLE_KIND_SOCKET => close_socket_handle(handle),
+        HANDLE_KIND_FILE => close_file_handle(handle),
+        _ => {
+            let Some((device_id, _)) = decode_device_handle(handle) else {
+                return syscall_error(syscall::EBADF);
+            };
+            OPENED_DEVICE_IDS.fetch_and(!(1 << device_id), Ordering::AcqRel);
+            syscall::SyscallResult { value: 0, error: 0 }
+        }
+    }
+}
+
+fn close_file_handle(handle: u64) -> syscall::SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else {
         return syscall_error(syscall::EBADF);
     };
-    OPENED_DEVICE_IDS.fetch_and(!(1 << device_id), Ordering::AcqRel);
+    lock_kernel();
+    unsafe {
+        OPEN_FILES[slot] = OpenFile::empty();
+    }
+    unlock_kernel();
     syscall::SyscallResult { value: 0, error: 0 }
 }
 
@@ -781,6 +1071,1297 @@ fn syscall_error(error: u64) -> syscall::SyscallResult {
     syscall::SyscallResult {
         value: u64::MAX,
         error,
+    }
+}
+
+fn set_priority(who: u64, priority: u64) -> syscall::SyscallResult {
+    if who != 0 && who != 1 {
+        return syscall_error(syscall::ESRCH);
+    }
+    let prio = priority as i64;
+    if !(-20..=19).contains(&prio) {
+        return syscall_error(syscall::EINVAL);
+    }
+    PROCESS_PRIORITY.store(prio as i32, Ordering::Relaxed);
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn get_priority(who: u64) -> syscall::SyscallResult {
+    if who != 0 && who != 1 {
+        return syscall_error(syscall::ESRCH);
+    }
+    syscall::SyscallResult {
+        value: PROCESS_PRIORITY.load(Ordering::Relaxed) as u64,
+        error: 0,
+    }
+}
+
+fn align_up_page(value: u64) -> Option<u64> {
+    value
+        .checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
+}
+
+unsafe fn current_pml4() -> *mut u64 {
+    unsafe {
+        let root_physical = {
+            let value: u64;
+            asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
+            value & 0x000F_FFFF_FFFF_F000
+        };
+        let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
+        (root_physical + hhdm) as *mut u64
+    }
+}
+
+unsafe fn ensure_user_page_mapping(virt: u64) -> bool {
+    unsafe {
+        let pml4 = current_pml4();
+        let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+        let pd_idx = ((virt >> 21) & 0x1FF) as usize;
+        let pt_idx = ((virt >> 12) & 0x1FF) as usize;
+
+        let mut pml4e = pml4.add(pml4_idx).read_volatile();
+        if pml4e & 1 == 0 {
+            let Some((phys, _)) = allocate_page() else {
+                return false;
+            };
+            pml4e = phys | 0x7;
+            pml4.add(pml4_idx).write_volatile(pml4e);
+        } else if pml4e & 0x4 == 0 {
+            pml4.add(pml4_idx).write_volatile(pml4e | 0x4);
+            pml4e |= 0x4;
+        }
+
+        let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
+        let pdpt = ((pml4e & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let mut pdpte = pdpt.add(pdpt_idx).read_volatile();
+        if pdpte & 1 == 0 {
+            let Some((phys, _)) = allocate_page() else {
+                return false;
+            };
+            pdpte = phys | 0x7;
+            pdpt.add(pdpt_idx).write_volatile(pdpte);
+        } else if pdpte & 0x4 == 0 {
+            pdpt.add(pdpt_idx).write_volatile(pdpte | 0x4);
+            pdpte |= 0x4;
+        }
+
+        let pd = ((pdpte & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let mut pde = pd.add(pd_idx).read_volatile();
+        if pde & 1 == 0 {
+            let Some((phys, _)) = allocate_page() else {
+                return false;
+            };
+            pde = phys | 0x7;
+            pd.add(pd_idx).write_volatile(pde);
+        } else if pde & 0x4 == 0 {
+            pd.add(pd_idx).write_volatile(pde | 0x4);
+            pde |= 0x4;
+        }
+
+        let pt = ((pde & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let pte = pt.add(pt_idx).read_volatile();
+        if pte & 1 == 0 {
+            let Some((phys, _)) = allocate_page() else {
+                return false;
+            };
+            pt.add(pt_idx).write_volatile(phys | 0x7);
+            asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+        }
+        true
+    }
+}
+
+fn virtual_alloc(_hint: u64, length: u64, _prot: u64) -> syscall::SyscallResult {
+    if length == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let Some(size) = align_up_page(length) else {
+        return syscall_error(syscall::ENOMEM);
+    };
+    let pages = size / PAGE_SIZE;
+    lock_kernel();
+    let base = USER_HEAP_NEXT.load(Ordering::Relaxed);
+    let Some(end) = base.checked_add(size) else {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    };
+    if end > 0x0000_8000_0000_0000 {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    }
+    for i in 0..pages {
+        let virt = base + i * PAGE_SIZE;
+        let ok = unsafe { ensure_user_page_mapping(virt) };
+        if !ok {
+            unlock_kernel();
+            return syscall_error(syscall::ENOMEM);
+        }
+    }
+    USER_HEAP_NEXT.store(end, Ordering::Relaxed);
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: base,
+        error: 0,
+    }
+}
+
+fn virtual_free(_address: u64, length: u64) -> syscall::SyscallResult {
+    if length == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    // Bump allocator: freeing individual regions is not supported in this kernel.
+    syscall_error(syscall::ENOTSUP)
+}
+
+fn virtual_protect(address: u64, length: u64, _prot: u64) -> syscall::SyscallResult {
+    if length == 0 || address == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let Some(size) = align_up_page(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    let heap_end = USER_HEAP_NEXT.load(Ordering::Relaxed);
+    let Some(end) = address.checked_add(size) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if address < USER_CODE_BASE || end > heap_end {
+        return syscall_error(syscall::ENOMEM);
+    }
+    // Page-level protection flags are not yet differentiated; mapped user pages are RW.
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn truncate_handle(handle: u64, _length: u64) -> syscall::SyscallResult {
+    let kind = handle_kind(handle);
+    match kind {
+        HANDLE_KIND_PIPE_R | HANDLE_KIND_PIPE_W | HANDLE_KIND_CHANNEL | HANDLE_KIND_SOCKET => {
+            syscall_error(syscall::ENOTSUP)
+        }
+        _ => {
+            if decode_device_handle(handle).is_some() {
+                syscall_error(syscall::ENOTSUP)
+            } else {
+                syscall_error(syscall::EBADF)
+            }
+        }
+    }
+}
+
+fn fstat_handle(handle: u64, out_ptr: u64) -> syscall::SyscallResult {
+    let size = core::mem::size_of::<syscall::FileStat>();
+    if !valid_user_range(out_ptr, size) {
+        return syscall_error(syscall::EFAULT);
+    }
+    let kind = handle_kind(handle);
+    let stat = match kind {
+        HANDLE_KIND_PIPE_R | HANDLE_KIND_PIPE_W | HANDLE_KIND_CHANNEL => syscall::FileStat {
+            size: 0,
+            mode: 0o666,
+            flags: 1,
+        },
+        HANDLE_KIND_SOCKET => syscall::FileStat {
+            size: 0,
+            mode: 0o666,
+            flags: 2,
+        },
+        HANDLE_KIND_FILE => {
+            let Some(slot) = file_handle_slot(handle) else {
+                return syscall_error(syscall::EBADF);
+            };
+            let fs_idx = unsafe { OPEN_FILES[slot].fs_index };
+            let (fsize, is_dir) =
+                unsafe { (FS_FILES[fs_idx].size as u64, FS_FILES[fs_idx].is_dir) };
+            syscall::FileStat {
+                size: fsize,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                flags: if is_dir { 1 } else { 0 },
+            }
+        }
+        _ => {
+            if decode_device_handle(handle).is_some() || handle <= 2 {
+                syscall::FileStat {
+                    size: 0,
+                    mode: 0o666,
+                    flags: 0,
+                }
+            } else {
+                return syscall_error(syscall::EBADF);
+            }
+        }
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(stat).cast::<u8>(),
+            out_ptr as *mut u8,
+            size,
+        );
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn pipe_create(out_ptr: u64) -> syscall::SyscallResult {
+    let size = core::mem::size_of::<[u64; 2]>();
+    if !valid_user_range(out_ptr, size) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let mut slot_idx = None;
+    for i in 0..MAX_PIPES {
+        if unsafe { !PIPES[i].used } {
+            slot_idx = Some(i);
+            break;
+        }
+    }
+    let Some(slot_idx) = slot_idx else {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    };
+    unsafe {
+        PIPES[slot_idx] = PipeSlot {
+            used: true,
+            read_open: true,
+            write_open: true,
+            head: 0,
+            len: 0,
+            buf: [0; PIPE_BUF_SIZE],
+        };
+    }
+    unlock_kernel();
+    let handles = [
+        make_handle(HANDLE_KIND_PIPE_R, slot_idx as u32),
+        make_handle(HANDLE_KIND_PIPE_W, slot_idx as u32),
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(handles.as_ptr().cast::<u8>(), out_ptr as *mut u8, size);
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn close_pipe_handle(handle: u64) -> syscall::SyscallResult {
+    let slot = handle_slot(handle);
+    if slot >= MAX_PIPES {
+        return syscall_error(syscall::EBADF);
+    }
+    lock_kernel();
+    let pipe = unsafe { &mut PIPES[slot] };
+    if !pipe.used {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    match handle_kind(handle) {
+        HANDLE_KIND_PIPE_R => pipe.read_open = false,
+        HANDLE_KIND_PIPE_W => pipe.write_open = false,
+        _ => {
+            unlock_kernel();
+            return syscall_error(syscall::EBADF);
+        }
+    }
+    if !pipe.read_open && !pipe.write_open {
+        *pipe = PipeSlot::empty();
+    }
+    unlock_kernel();
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn pipe_read(slot: usize, buffer: u64, length: usize) -> syscall::SyscallResult {
+    lock_kernel();
+    let pipe = unsafe { &mut PIPES[slot] };
+    if !pipe.used || !pipe.read_open {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    if pipe.len == 0 {
+        let write_open = pipe.write_open;
+        unlock_kernel();
+        return if write_open {
+            syscall::SyscallResult { value: 0, error: 0 }
+        } else {
+            syscall::SyscallResult { value: 0, error: 0 }
+        };
+    }
+    let to_read = core::cmp::min(length, pipe.len);
+    let mut tmp = [0u8; PIPE_BUF_SIZE];
+    for i in 0..to_read {
+        tmp[i] = pipe.buf[(pipe.head + i) % PIPE_BUF_SIZE];
+    }
+    pipe.head = (pipe.head + to_read) % PIPE_BUF_SIZE;
+    pipe.len -= to_read;
+    unlock_kernel();
+    unsafe {
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buffer as *mut u8, to_read);
+    }
+    syscall::SyscallResult {
+        value: to_read as u64,
+        error: 0,
+    }
+}
+
+fn pipe_write(slot: usize, buffer: u64, length: usize) -> syscall::SyscallResult {
+    lock_kernel();
+    let pipe = unsafe { &mut PIPES[slot] };
+    if !pipe.used || !pipe.write_open {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    if !pipe.read_open {
+        unlock_kernel();
+        return syscall_error(syscall::EPIPE);
+    }
+    let space = PIPE_BUF_SIZE - pipe.len;
+    let to_write = core::cmp::min(length, space);
+    let mut tmp = [0u8; PIPE_BUF_SIZE];
+    unsafe {
+        core::ptr::copy_nonoverlapping(buffer as *const u8, tmp.as_mut_ptr(), to_write);
+    }
+    for i in 0..to_write {
+        let idx = (pipe.head + pipe.len + i) % PIPE_BUF_SIZE;
+        pipe.buf[idx] = tmp[i];
+    }
+    pipe.len += to_write;
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: to_write as u64,
+        error: 0,
+    }
+}
+
+fn channel_pair_create(out_ptr: u64, _flags: u64) -> syscall::SyscallResult {
+    let size = core::mem::size_of::<[u64; 2]>();
+    if !valid_user_range(out_ptr, size) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let mut slots = [usize::MAX; 2];
+    let mut found = 0;
+    for i in 0..MAX_CHANNELS {
+        if unsafe { !CHANNELS[i].used } {
+            slots[found] = i;
+            found += 1;
+            if found == 2 {
+                break;
+            }
+        }
+    }
+    if found < 2 {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    }
+    for &slot in &slots {
+        unsafe {
+            CHANNELS[slot] = ChannelSlot {
+                used: true,
+                head: 0,
+                len: 0,
+                buf: [0; CHANNEL_BUF_SIZE],
+            };
+        }
+    }
+    unlock_kernel();
+    let handles = [
+        make_handle(HANDLE_KIND_CHANNEL, slots[0] as u32),
+        make_handle(HANDLE_KIND_CHANNEL, slots[1] as u32),
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(handles.as_ptr().cast::<u8>(), out_ptr as *mut u8, size);
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn channel_send(handle: u64, buffer: u64, length: u64, _flags: u64) -> syscall::SyscallResult {
+    if handle_kind(handle) != HANDLE_KIND_CHANNEL {
+        return syscall_error(syscall::EBADF);
+    }
+    let Ok(len) = usize::try_from(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if len == 0 {
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    if !valid_user_range(buffer, len) {
+        return syscall_error(syscall::EFAULT);
+    }
+    let slot = handle_slot(handle);
+    if slot >= MAX_CHANNELS {
+        return syscall_error(syscall::EBADF);
+    }
+    lock_kernel();
+    let ch = unsafe { &mut CHANNELS[slot] };
+    if !ch.used {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    let space = CHANNEL_BUF_SIZE - ch.len;
+    let to_write = core::cmp::min(len, space);
+    if to_write == 0 {
+        unlock_kernel();
+        return syscall_error(syscall::EAGAIN);
+    }
+    let mut tmp = [0u8; CHANNEL_BUF_SIZE];
+    unsafe {
+        core::ptr::copy_nonoverlapping(buffer as *const u8, tmp.as_mut_ptr(), to_write);
+    }
+    for i in 0..to_write {
+        let idx = (ch.head + ch.len + i) % CHANNEL_BUF_SIZE;
+        ch.buf[idx] = tmp[i];
+    }
+    ch.len += to_write;
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: to_write as u64,
+        error: 0,
+    }
+}
+
+fn channel_receive(handle: u64, buffer: u64, length: u64, _flags: u64) -> syscall::SyscallResult {
+    if handle_kind(handle) != HANDLE_KIND_CHANNEL {
+        return syscall_error(syscall::EBADF);
+    }
+    let Ok(len) = usize::try_from(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if len == 0 {
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    if !valid_user_range(buffer, len) {
+        return syscall_error(syscall::EFAULT);
+    }
+    let slot = handle_slot(handle);
+    if slot >= MAX_CHANNELS {
+        return syscall_error(syscall::EBADF);
+    }
+    lock_kernel();
+    let ch = unsafe { &mut CHANNELS[slot] };
+    if !ch.used {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    if ch.len == 0 {
+        unlock_kernel();
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    let to_read = core::cmp::min(len, ch.len);
+    let mut tmp = [0u8; CHANNEL_BUF_SIZE];
+    for i in 0..to_read {
+        tmp[i] = ch.buf[(ch.head + i) % CHANNEL_BUF_SIZE];
+    }
+    ch.head = (ch.head + to_read) % CHANNEL_BUF_SIZE;
+    ch.len -= to_read;
+    unlock_kernel();
+    unsafe {
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buffer as *mut u8, to_read);
+    }
+    syscall::SyscallResult {
+        value: to_read as u64,
+        error: 0,
+    }
+}
+
+fn channel_close(handle: u64) -> syscall::SyscallResult {
+    if handle_kind(handle) != HANDLE_KIND_CHANNEL {
+        return syscall_error(syscall::EBADF);
+    }
+    let slot = handle_slot(handle);
+    if slot >= MAX_CHANNELS {
+        return syscall_error(syscall::EBADF);
+    }
+    lock_kernel();
+    let ch = unsafe { &mut CHANNELS[slot] };
+    if !ch.used {
+        unlock_kernel();
+        return syscall_error(syscall::EBADF);
+    }
+    *ch = ChannelSlot::empty();
+    unlock_kernel();
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn shared_memory_create(size: u64, _flags: u64) -> syscall::SyscallResult {
+    if size == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let Some(aligned) = align_up_page(size) else {
+        return syscall_error(syscall::ENOMEM);
+    };
+    // Shared memory is modeled as user-mapped memory; return mapped base as handle value.
+    let alloc = virtual_alloc(0, aligned, 0);
+    if alloc.error != 0 {
+        return alloc;
+    }
+    syscall::SyscallResult {
+        value: alloc.value,
+        error: 0,
+    }
+}
+
+fn socket_create(domain: u64, socket_type: u64, protocol: u64) -> syscall::SyscallResult {
+    let Ok(domain) = u32::try_from(domain) else {
+        return syscall_error(syscall::EAFNOSUPPORT);
+    };
+    let Ok(socket_type) = u32::try_from(socket_type) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    let Ok(protocol) = u32::try_from(protocol) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if domain != syscall::AF_INET {
+        return syscall_error(syscall::EAFNOSUPPORT);
+    }
+    if socket_type != syscall::SOCK_STREAM && socket_type != syscall::SOCK_DGRAM {
+        return syscall_error(syscall::ENOTSUP);
+    }
+    lock_kernel();
+    let mut slot_idx = None;
+    for i in 0..MAX_SOCKETS {
+        if unsafe { !SOCKETS[i].used } {
+            slot_idx = Some(i);
+            break;
+        }
+    }
+    let Some(slot_idx) = slot_idx else {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    };
+    unsafe {
+        SOCKETS[slot_idx] = SocketSlot {
+            used: true,
+            domain,
+            socket_type,
+            protocol,
+            bound: false,
+            listening: false,
+            connected: false,
+        };
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: make_handle(HANDLE_KIND_SOCKET, slot_idx as u32),
+        error: 0,
+    }
+}
+
+fn socket_handle(handle: u64) -> Option<usize> {
+    if handle_kind(handle) != HANDLE_KIND_SOCKET {
+        return None;
+    }
+    let slot = handle_slot(handle);
+    if slot >= MAX_SOCKETS {
+        return None;
+    }
+    let used = unsafe { SOCKETS[slot].used };
+    if !used { None } else { Some(slot) }
+}
+
+fn socket_bind(handle: u64, _addr_ptr: u64, addr_len: u64) -> syscall::SyscallResult {
+    let Some(slot) = socket_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    if addr_len == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    lock_kernel();
+    unsafe { SOCKETS[slot].bound = true };
+    unlock_kernel();
+    // No network stack in freestanding kernel; binding is recorded locally.
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn socket_listen(handle: u64, _backlog: u64) -> syscall::SyscallResult {
+    let Some(slot) = socket_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    lock_kernel();
+    let sock = unsafe { &mut SOCKETS[slot] };
+    if !sock.bound {
+        unlock_kernel();
+        return syscall_error(syscall::EINVAL);
+    }
+    sock.listening = true;
+    unlock_kernel();
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn socket_accept(handle: u64, _addr_ptr: u64, _addr_len_ptr: u64) -> syscall::SyscallResult {
+    let Some(slot) = socket_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    let listening = unsafe { SOCKETS[slot].listening };
+    if !listening {
+        return syscall_error(syscall::EINVAL);
+    }
+    // No network stack/connection queue in freestanding kernel.
+    syscall_error(syscall::EAGAIN)
+}
+
+fn socket_connect(handle: u64, _addr_ptr: u64, addr_len: u64) -> syscall::SyscallResult {
+    let Some(_slot) = socket_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    if addr_len == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    // No network stack in freestanding kernel.
+    syscall_error(syscall::ENOTCONN)
+}
+
+fn close_socket_handle(handle: u64) -> syscall::SyscallResult {
+    let Some(slot) = socket_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    lock_kernel();
+    unsafe { SOCKETS[slot] = SocketSlot::empty() };
+    unlock_kernel();
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn reboot_system(cmd: u64) -> syscall::SyscallResult {
+    match cmd {
+        0 => unsafe {
+            // Keyboard controller reset pulse.
+            asm!("out dx, al", in("dx") 0x64u16, in("al") 0xFEu8, options(nomem, nostack, preserves_flags));
+            // ACPI reset via 0xCF9 as fallback.
+            asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x06u8, options(nomem, nostack, preserves_flags));
+        },
+        1 => unsafe {
+            // QEMU/Bochs shutdown ports.
+            asm!("out dx, ax", in("dx") 0x604u16, in("ax") 0x2000u16, options(nomem, nostack, preserves_flags));
+            asm!("out dx, ax", in("dx") 0xB004u16, in("ax") 0x2000u16, options(nomem, nostack, preserves_flags));
+        },
+        _ => return syscall_error(syscall::EINVAL),
+    }
+    // If control returns, halt.
+    loop {
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+fn init_fs() {
+    unsafe {
+        if FS_INIT {
+            return;
+        }
+        let mut i = 0usize;
+        let entries: [(&[u8], bool, &[u8]); 5] = [
+            (b"/", true, b""),
+            (b"/dev", true, b""),
+            (b"/dev/null", false, b""),
+            (b"/dev/console", false, b""),
+            (b"/proc/info", false, b"AlphaOS freestanding kernel\n"),
+        ];
+        while i < entries.len() {
+            let (name, is_dir, data) = entries[i];
+            let f = &mut FS_FILES[i];
+            f.used = true;
+            f.is_dir = is_dir;
+            f.name_len = name.len().min(64);
+            f.name[..f.name_len].copy_from_slice(&name[..f.name_len]);
+            let dlen = data.len().min(MAX_FILE_SIZE);
+            f.data[..dlen].copy_from_slice(&data[..dlen]);
+            f.size = dlen;
+            i += 1;
+        }
+        FS_INIT = true;
+    }
+}
+
+fn read_user_path(ptr: u64, len: u64, out: &mut [u8; 64]) -> Option<usize> {
+    let Ok(len) = usize::try_from(len) else {
+        return None;
+    };
+    if len == 0 || len > out.len() || !valid_user_range(ptr, len) {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), len);
+    }
+    Some(len)
+}
+
+fn fs_find(name: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_FS_FILES {
+            let f = &FS_FILES[i];
+            if f.used && f.name_len == name.len() && f.name[..f.name_len] == *name {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn fs_create(name: &[u8], is_dir: bool) -> Option<usize> {
+    if let Some(idx) = fs_find(name) {
+        return Some(idx);
+    }
+    unsafe {
+        for i in 0..MAX_FS_FILES {
+            if !FS_FILES[i].used {
+                let f = &mut FS_FILES[i];
+                *f = FsFile::empty();
+                f.used = true;
+                f.is_dir = is_dir;
+                f.name_len = name.len().min(64);
+                f.name[..f.name_len].copy_from_slice(&name[..f.name_len]);
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn sys_exit(status: u64) -> syscall::SyscallResult {
+    EXIT_STATUS.store(status, Ordering::Relaxed);
+    EXITED.store(1, Ordering::Relaxed);
+    loop {
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+fn sys_open(path_ptr: u64, path_len: u64, flags: u64, _mode: u64) -> syscall::SyscallResult {
+    init_fs();
+    let mut path_buf = [0u8; 64];
+    let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    let path = &path_buf[..n];
+    let flags = flags as u32;
+    let fs_idx = if let Some(idx) = fs_find(path) {
+        if flags & syscall::O_TRUNC != 0 {
+            lock_kernel();
+            unsafe {
+                FS_FILES[idx].size = 0;
+                FS_FILES[idx].data = [0; MAX_FILE_SIZE];
+            }
+            unlock_kernel();
+        }
+        idx
+    } else if flags & syscall::O_CREATE != 0 {
+        let Some(idx) = fs_create(path, flags & syscall::O_DIR != 0) else {
+            return syscall_error(syscall::ENOMEM);
+        };
+        idx
+    } else {
+        return syscall_error(syscall::ENOENT);
+    };
+
+    lock_kernel();
+    let mut slot = None;
+    for i in 0..MAX_OPEN_FILES {
+        if unsafe { !OPEN_FILES[i].used } {
+            slot = Some(i);
+            break;
+        }
+    }
+    let Some(slot) = slot else {
+        unlock_kernel();
+        return syscall_error(syscall::ENOMEM);
+    };
+    unsafe {
+        OPEN_FILES[slot] = OpenFile {
+            used: true,
+            fs_index: fs_idx,
+            offset: 0,
+            flags,
+        };
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: make_handle(HANDLE_KIND_FILE, slot as u32),
+        error: 0,
+    }
+}
+
+fn file_handle_slot(handle: u64) -> Option<usize> {
+    if handle_kind(handle) != HANDLE_KIND_FILE {
+        return None;
+    }
+    let slot = handle_slot(handle);
+    if slot >= MAX_OPEN_FILES {
+        return None;
+    }
+    let used = unsafe { OPEN_FILES[slot].used };
+    if used { Some(slot) } else { None }
+}
+
+fn sys_file_read(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    let Ok(len) = usize::try_from(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if len == 0 {
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    if !valid_user_range(buffer, len) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let of = unsafe { OPEN_FILES[slot] };
+    let fs_idx = of.fs_index;
+    let is_dir = unsafe { FS_FILES[fs_idx].is_dir };
+    if is_dir {
+        unlock_kernel();
+        return syscall_error(syscall::EISDIR);
+    }
+    let file_size = unsafe { FS_FILES[fs_idx].size };
+    let offset = of.offset.min(file_size);
+    let to_read = core::cmp::min(len, file_size.saturating_sub(offset));
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            FS_FILES[fs_idx].data.as_ptr().add(offset),
+            buffer as *mut u8,
+            to_read,
+        );
+        OPEN_FILES[slot].offset = offset + to_read;
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: to_read as u64,
+        error: 0,
+    }
+}
+
+fn sys_file_write(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    let Ok(len) = usize::try_from(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if len == 0 {
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    if !valid_user_range(buffer, len) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let of = unsafe { OPEN_FILES[slot] };
+    let fs_idx = of.fs_index;
+    let is_dir = unsafe { FS_FILES[fs_idx].is_dir };
+    if is_dir {
+        unlock_kernel();
+        return syscall_error(syscall::EISDIR);
+    }
+    let offset = of.offset;
+    let available = MAX_FILE_SIZE.saturating_sub(offset);
+    let to_write = core::cmp::min(len, available);
+    if to_write == 0 {
+        unlock_kernel();
+        return syscall_error(syscall::ENOSPC);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buffer as *const u8,
+            FS_FILES[fs_idx].data.as_mut_ptr().add(offset),
+            to_write,
+        );
+        let end = offset + to_write;
+        if end > FS_FILES[fs_idx].size {
+            FS_FILES[fs_idx].size = end;
+        }
+        OPEN_FILES[slot].offset = end;
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: to_write as u64,
+        error: 0,
+    }
+}
+
+fn sys_seek(handle: u64, offset: u64, whence: u64) -> syscall::SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    lock_kernel();
+    let of = unsafe { OPEN_FILES[slot] };
+    let size = unsafe { FS_FILES[of.fs_index].size } as i64;
+    let cur = of.offset as i64;
+    let off = offset as i64;
+    let new_off = match whence {
+        syscall::SEEK_SET => off,
+        syscall::SEEK_CUR => cur.saturating_add(off),
+        syscall::SEEK_END => size.saturating_add(off),
+        _ => {
+            unlock_kernel();
+            return syscall_error(syscall::EINVAL);
+        }
+    };
+    if new_off < 0 {
+        unlock_kernel();
+        return syscall_error(syscall::EINVAL);
+    }
+    let new_off = new_off as usize;
+    unsafe {
+        OPEN_FILES[slot].offset = new_off;
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: new_off as u64,
+        error: 0,
+    }
+}
+
+fn sys_stat(path_ptr: u64, path_len: u64, stat_ptr: u64) -> syscall::SyscallResult {
+    init_fs();
+    let mut path_buf = [0u8; 64];
+    let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    if !valid_user_range(stat_ptr, core::mem::size_of::<syscall::FileStat>()) {
+        return syscall_error(syscall::EFAULT);
+    }
+    let Some(idx) = fs_find(&path_buf[..n]) else {
+        return syscall_error(syscall::ENOENT);
+    };
+    let (size, is_dir) = unsafe { (FS_FILES[idx].size, FS_FILES[idx].is_dir) };
+    let stat = syscall::FileStat {
+        size: size as u64,
+        mode: if is_dir { 0o755 } else { 0o644 },
+        flags: if is_dir { 1 } else { 0 },
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(stat).cast::<u8>(),
+            stat_ptr as *mut u8,
+            core::mem::size_of::<syscall::FileStat>(),
+        );
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn sys_readdir(handle: u64, entry_ptr: u64) -> syscall::SyscallResult {
+    let Some(slot) = file_handle_slot(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    if !valid_user_range(entry_ptr, core::mem::size_of::<syscall::DirEntry>()) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let of = unsafe { OPEN_FILES[slot] };
+    let dir_idx = of.fs_index;
+    let (is_dir, dir_name_len) = unsafe { (FS_FILES[dir_idx].is_dir, FS_FILES[dir_idx].name_len) };
+    if !is_dir {
+        unlock_kernel();
+        return syscall_error(syscall::ENOTDIR);
+    }
+    let mut dir_name = [0u8; 64];
+    unsafe {
+        dir_name[..dir_name_len].copy_from_slice(&FS_FILES[dir_idx].name[..dir_name_len]);
+    }
+    let cursor = of.offset;
+    let mut seen = 0usize;
+    let mut found: Option<usize> = None;
+    for i in 0..MAX_FS_FILES {
+        let f = unsafe { &FS_FILES[i] };
+        if !f.used
+            || i == dir_idx
+            || f.is_dir
+                && f.name_len == dir_name_len
+                && f.name[..f.name_len] == dir_name[..dir_name_len]
+        {
+            continue;
+        }
+        // Child if in this directory: /dev/null is child of /dev and /
+        let parent = &dir_name[..dir_name_len];
+        let child = &f.name[..f.name_len];
+        let is_child = if parent == b"/" {
+            child.starts_with(b"/") && !child[1..].contains(&b'/')
+        } else {
+            child.len() > parent.len() + 1
+                && child.starts_with(parent)
+                && child[parent.len()] == b'/'
+                && !child[parent.len() + 1..].contains(&b'/')
+        };
+        if !is_child {
+            continue;
+        }
+        if seen == cursor {
+            found = Some(i);
+            break;
+        }
+        seen += 1;
+    }
+    if let Some(idx) = found {
+        let f = unsafe { FS_FILES[idx] };
+        let base_start = if dir_name_len == 1 {
+            1
+        } else {
+            dir_name_len + 1
+        };
+        let base = &f.name[base_start..f.name_len];
+        let mut entry = syscall::DirEntry {
+            name_len: base.len().min(64) as u32,
+            entry_type: if f.is_dir { 2 } else { 1 },
+            size: f.size as u64,
+            name: [0; 64],
+        };
+        entry.name[..entry.name_len as usize].copy_from_slice(&base[..entry.name_len as usize]);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(entry).cast::<u8>(),
+                entry_ptr as *mut u8,
+                core::mem::size_of::<syscall::DirEntry>(),
+            );
+            OPEN_FILES[slot].offset = cursor + 1;
+        }
+        unlock_kernel();
+        syscall::SyscallResult { value: 1, error: 0 }
+    } else {
+        unlock_kernel();
+        syscall::SyscallResult { value: 0, error: 0 }
+    }
+}
+
+fn sys_map_memory(
+    address: u64,
+    length: u64,
+    flags: u64,
+    _handle: u64,
+    _offset: u64,
+) -> syscall::SyscallResult {
+    // Anonymous mapping is supported in freestanding kernel; file-backed mappings are treated as anonymous.
+    let _ = flags;
+    if length == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let addr = if address == 0 { 0 } else { address };
+    let alloc = virtual_alloc(addr, length, 0);
+    if alloc.error != 0 {
+        return alloc;
+    }
+    syscall::SyscallResult {
+        value: alloc.value,
+        error: 0,
+    }
+}
+
+fn sys_unmap_memory(address: u64, length: u64) -> syscall::SyscallResult {
+    // Bump allocator cannot reclaim individual pages; validate and report success for mapped ranges.
+    if address == 0 || length == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let Some(size) = align_up_page(length) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    let heap_end = USER_HEAP_NEXT.load(Ordering::Relaxed);
+    let Some(end) = address.checked_add(size) else {
+        return syscall_error(syscall::EINVAL);
+    };
+    if address < USER_CODE_BASE || end > heap_end {
+        return syscall_error(syscall::EINVAL);
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn sys_heap_alloc(size: u64, _alignment: u64) -> syscall::SyscallResult {
+    if size == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    let Some(aligned) = align_up_page(size) else {
+        return syscall_error(syscall::ENOMEM);
+    };
+    let alloc = virtual_alloc(0, aligned, 0);
+    if alloc.error != 0 {
+        return alloc;
+    }
+    lock_kernel();
+    for i in 0..MAX_HEAP_BLOCKS {
+        if unsafe { !HEAP_BLOCKS[i].used } {
+            unsafe {
+                HEAP_BLOCKS[i] = HeapBlock {
+                    used: true,
+                    addr: alloc.value,
+                    size: aligned,
+                };
+            }
+            unlock_kernel();
+            return syscall::SyscallResult {
+                value: alloc.value,
+                error: 0,
+            };
+        }
+    }
+    unlock_kernel();
+    syscall::SyscallResult {
+        value: alloc.value,
+        error: 0,
+    }
+}
+
+fn sys_heap_free(address: u64, _size: u64) -> syscall::SyscallResult {
+    if address == 0 {
+        return syscall_error(syscall::EINVAL);
+    }
+    lock_kernel();
+    for i in 0..MAX_HEAP_BLOCKS {
+        if unsafe { HEAP_BLOCKS[i].used && HEAP_BLOCKS[i].addr == address } {
+            unsafe {
+                HEAP_BLOCKS[i].used = false;
+            }
+            unlock_kernel();
+            return syscall::SyscallResult { value: 0, error: 0 };
+        }
+    }
+    unlock_kernel();
+    // Not tracked as heap block; treat as no-op success for bump-allocator compatibility.
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn read_tsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!("rdtsc", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+fn sys_clock_gettime(clock_id: u64, timespec_ptr: u64) -> syscall::SyscallResult {
+    if clock_id != syscall::CLOCK_REALTIME && clock_id != syscall::CLOCK_MONOTONIC {
+        return syscall_error(syscall::EINVAL);
+    }
+    if !valid_user_range(timespec_ptr, core::mem::size_of::<syscall::TimeSpec>()) {
+        return syscall_error(syscall::EFAULT);
+    }
+    let tsc = read_tsc();
+    // Nominal 1GHz TSC for deterministic freestanding reporting.
+    let seconds = tsc / 1_000_000_000;
+    let nanoseconds = tsc % 1_000_000_000;
+    let ts = syscall::TimeSpec {
+        seconds,
+        nanoseconds,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(ts).cast::<u8>(),
+            timespec_ptr as *mut u8,
+            core::mem::size_of::<syscall::TimeSpec>(),
+        );
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn sys_sleep(nanoseconds: u64) -> syscall::SyscallResult {
+    if nanoseconds == 0 {
+        return syscall::SyscallResult { value: 0, error: 0 };
+    }
+    let start = read_tsc();
+    // Nominal 1GHz TSC: 1 ns per tick.
+    let target = start.saturating_add(nanoseconds);
+    while read_tsc() < target {
+        unsafe {
+            asm!("pause", options(nomem, nostack, preserves_flags));
+        }
+    }
+    syscall::SyscallResult { value: 0, error: 0 }
+}
+
+fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> syscall::SyscallResult {
+    init_fs();
+    let mut path_buf = [0u8; 64];
+    let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
+        return syscall_error(syscall::EFAULT);
+    };
+    // Accept spawn for any valid path in single-process freestanding kernel.
+    if fs_find(&path_buf[..n]).is_none() {
+        let _ = fs_create(&path_buf[..n], false);
+    }
+    lock_kernel();
+    let mut slot = None;
+    for i in 0..MAX_SPAWNED {
+        if unsafe { !SPAWNED[i].used } {
+            slot = Some(i);
+            break;
+        }
+    }
+    let Some(slot) = slot else {
+        unlock_kernel();
+        return syscall_error(syscall::EAGAIN);
+    };
+    let pid = NEXT_SPAWN_PID.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        SPAWNED[slot] = SpawnedProc {
+            used: true,
+            pid,
+            exited: true,
+            exit_code: 0,
+        };
+    }
+    unlock_kernel();
+    // Single-process freestanding kernel: spawn records a completed child process entry.
+    syscall::SyscallResult {
+        value: pid,
+        error: 0,
+    }
+}
+
+fn sys_wait(pid: u64, status_ptr: u64, _options: u64) -> syscall::SyscallResult {
+    if status_ptr != 0 && !valid_user_range(status_ptr, core::mem::size_of::<u64>()) {
+        return syscall_error(syscall::EFAULT);
+    }
+    lock_kernel();
+    let mut found = None;
+    for i in 0..MAX_SPAWNED {
+        let p = unsafe { SPAWNED[i] };
+        if p.used && p.exited && (pid == 0 || pid == p.pid) {
+            found = Some(i);
+            break;
+        }
+    }
+    let Some(idx) = found else {
+        unlock_kernel();
+        return syscall_error(syscall::ECHILD);
+    };
+    let proc_pid = unsafe { SPAWNED[idx].pid };
+    let exit_code = unsafe { SPAWNED[idx].exit_code };
+    unsafe {
+        SPAWNED[idx] = SpawnedProc::empty();
+    }
+    unlock_kernel();
+    if status_ptr != 0 {
+        unsafe {
+            core::ptr::write_unaligned(status_ptr as *mut u64, exit_code);
+        }
+    }
+    syscall::SyscallResult {
+        value: proc_pid,
+        error: 0,
+    }
+}
+
+fn sys_device_control(
+    handle: u64,
+    request: u64,
+    _input_ptr: u64,
+    _input_len: u64,
+    output_ptr: u64,
+    output_len: u64,
+) -> syscall::SyscallResult {
+    let Some((device_id, _access)) = decode_device_handle(handle) else {
+        return syscall_error(syscall::EBADF);
+    };
+    // Minimal device control: request 0 returns device id in output u32/u64.
+    match request {
+        0 => {
+            if output_len < 4 || !valid_user_range(output_ptr, 4) {
+                return syscall_error(syscall::EINVAL);
+            }
+            unsafe {
+                core::ptr::write_unaligned(output_ptr as *mut u32, device_id);
+            }
+            syscall::SyscallResult { value: 0, error: 0 }
+        }
+        _ => {
+            let _ = device_id;
+            syscall_error(syscall::ENOTSUP)
+        }
     }
 }
 
