@@ -19,7 +19,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust target
-        run: rustup target add x86_64-unknown-uefi x86_64-unknown-none
+        run: |
+          rustup component add rustfmt
+          rustup target add x86_64-unknown-uefi x86_64-unknown-none
 
       - name: Check UEFI boot manager formatting
         run: cargo fmt -p alphaos-bootloader -- --check

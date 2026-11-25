@@ -729,9 +729,10 @@ extern "C" fn kernel_run_loop() {
         lock_kernel();
         unsafe {
             for i in 0..MAX_SPAWNED {
-                if SPAWNED[i].used && SPAWNED[i].ready && !SPAWNED[i].exited {
-                    found = Some((i, SPAWNED[i].pid, SPAWNED[i].entry));
-                    SPAWNED[i].ready = false;
+                let p = *core::ptr::addr_of!(SPAWNED[i]);
+                if p.used && p.ready && !p.exited {
+                    found = Some((i, p.pid, p.entry));
+                    (*core::ptr::addr_of_mut!(SPAWNED[i])).ready = false;
                     break;
                 }
             }
@@ -746,17 +747,22 @@ extern "C" fn kernel_run_loop() {
             unsafe { run_user_with_resume(entry, USER_STACK_TOP); }
             let exit_code = EXIT_STATUS.load(Ordering::Relaxed);
             lock_kernel();
+            let mut still_ready = false;
             unsafe {
                 for i in 0..MAX_SPAWNED {
-                    if SPAWNED[i].used && SPAWNED[i].pid == pid {
-                        if !SPAWNED[i].ready && !SPAWNED[i].exited {
-                            SPAWNED[i].exited = true;
-                            SPAWNED[i].exit_code = exit_code;
+                    let p = *core::ptr::addr_of!(SPAWNED[i]);
+                    if p.used && p.pid == pid {
+                        if p.ready {
+                            still_ready = true;
+                        } else if !p.exited {
+                            let slot = &mut *core::ptr::addr_of_mut!(SPAWNED[i]);
+                            slot.exited = true;
+                            slot.exit_code = exit_code;
                         }
                     }
                 }
             }
-            if !unsafe { (0..MAX_SPAWNED).any(|i| SPAWNED[i].used && SPAWNED[i].pid == pid && SPAWNED[i].ready) } {
+            if !still_ready {
                 CURRENT_PID.store(0, Ordering::Relaxed);
             }
             unlock_kernel();
