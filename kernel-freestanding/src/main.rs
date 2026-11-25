@@ -1,4 +1,4 @@
-#![no_main]
+﻿#![no_main]
 #![no_std]
 
 #[path = "../../kernel/src/font.rs"]
@@ -2587,11 +2587,11 @@ fn sc_net_socket_connect(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallRes
 }
 
 fn sc_net_socket_send(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
-    syscall::SyscallResult::error(syscall::ENOTSUP)
+    syscall_error(syscall::ENOTSUP)
 }
 
 fn sc_net_socket_recv(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> syscall::SyscallResult {
-    syscall::SyscallResult::error(syscall::ENOTSUP)
+    syscall_error(syscall::ENOTSUP)
 }
 
 fn sc_net_socket_close(arg0: u64) -> syscall::SyscallResult {
@@ -2607,11 +2607,11 @@ fn sc_net_socket_pair(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult
 }
 
 fn sc_net_get_local_addr(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
-    syscall::SyscallResult::error(syscall::ENOTSUP)
+    syscall_error(syscall::ENOTSUP)
 }
 
 fn sc_net_get_remote_addr(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
-    syscall::SyscallResult::error(syscall::ENOTSUP)
+    syscall_error(syscall::ENOTSUP)
 }
 
 fn sc_net_set_nonblocking(arg0: u64, arg1: u64) -> syscall::SyscallResult {
@@ -2631,7 +2631,7 @@ fn sc_net_set_hostname(arg0: u64, arg1: u64) -> syscall::SyscallResult {
 }
 
 fn sc_net_resolve_local(_arg0: u64, _arg1: u64, _arg2: u64) -> syscall::SyscallResult {
-    syscall::SyscallResult::error(syscall::ENOTSUP)
+    syscall_error(syscall::ENOTSUP)
 }
 
 fn sc_net_loopback_ping(arg0: u64) -> syscall::SyscallResult {
@@ -2943,7 +2943,7 @@ fn sc_kio_port_write(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult 
 }
 
 fn sc_kfb_get_info(arg0: u64) -> syscall::SyscallResult {
-    let con=unsafe{&*SYSCALL_CONSOLE}; #[repr(C)] struct Fb{addr:u64,width:u32,height:u32,pitch:u32,fmt:u32} let fb=Fb{addr:con.address as u64,width:con.width as u32,height:con.height as u32,pitch:con.pitch as u32,fmt:0u32}}; let b=unsafe{core::slice::from_raw_parts((&fb as *const Fb).cast::<u8>(),core::mem::size_of::<Fb>())}; match sc_copy_to_user(arg0,b.len() as u64,b){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)}
+    let con=unsafe{&*SYSCALL_CONSOLE}; #[repr(C)] struct Fb{addr:u64,width:u32,height:u32,pitch:u32,fmt:u32} let fb=Fb{addr:con.address as u64,width:con.width as u32,height:con.height as u32,pitch:con.pitch as u32,fmt:0u32}; let b=unsafe{core::slice::from_raw_parts((&fb as *const Fb).cast::<u8>(),core::mem::size_of::<Fb>())}; match sc_copy_to_user(arg0,b.len() as u64,b){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)}
 }
 
 fn sc_kfb_put_pixel(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> syscall::SyscallResult {
