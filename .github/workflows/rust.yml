@@ -33,7 +33,7 @@ jobs:
 
       - name: Check freestanding kernel formatting
         working-directory: kernel-freestanding
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all --check
 
       - name: Test syscall ABI
         working-directory: kernel-freestanding/syscall-abi
