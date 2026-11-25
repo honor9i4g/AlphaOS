@@ -147,9 +147,10 @@ Copy-Item .\target\x86_64-unknown-uefi\release\AlphaOS-Bootloader.efi `
 Use the `esp` folder to create a FAT-formatted ESP image, or copy its contents
 to an existing ESP. Keep the existing `ALPHAKRN.EFI` kernel file in place.
 To enable the freestanding menu entry, also copy the Limine UEFI executable to
-`esp/EFI/BOOT/LIMINE.EFI`, `kernel-freestanding/limine.conf` to the ESP root as
-`limine.conf`, and the built kernel ELF to `esp/boot/alphaos-kernel`. Without
-those optional files, use the classic entry.
+`esp/EFI/BOOT/LIMINE.EFI`, `kernel-freestanding/limine.conf` to both
+`esp/EFI/BOOT/limine.conf` and the ESP root as `limine.conf`, and the built
+kernel ELF to `esp/boot/alphaos-kernel`. Limine reads the configuration beside
+its EFI executable first. Without those optional files, use the classic entry.
 The Windows entry chainloads
 `EFI/Microsoft/Boot/bootmgfw.efi` from the same ESP when present.
 
