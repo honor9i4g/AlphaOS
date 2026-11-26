@@ -13,16 +13,16 @@ without losing the existing QEMU-testable shell.
   ring-3/syscall entry, RAMFS, input/framebuffer console, ELF64 loader, and
   M1 app-execution foundations (spawn/exec/wait/exit-to-kernel resume path).
 - **Not yet a full app-capable OS**: running Paint/Calculator-style or
-  third-party apps smoothly still requires major layers: a complete
-  process scheduler/preemption/threading model, userspace libc/SDK/toolchain,
-  persistent filesystem/storage drivers, richer device/input/graphics drivers,
-  windowing/compositor/UI toolkit, IPC/services, packaging, and security
-  hardening. M3 work has begun on per-process address-space isolation.
+  third-party apps smoothly still requires major layers: preemptive scheduling
+  and threading, userspace libc/SDK/toolchain, persistent filesystem/storage
+  drivers, richer device/input/graphics drivers, windowing/compositor/UI
+  toolkit, IPC/services, packaging, and security hardening. M3 provides private
+  process address spaces and cooperative scheduling.
 - **Runtime status**: M0 is boot-verified in QEMU: Limine loads the static
   freestanding ELF and the kernel reaches its framebuffer console. The M3
-  boot-time check verifies separate user mappings in two address spaces, but
-  this does not yet prove end-to-end process execution, interactive userspace,
-  or a stable OS.
+  QEMU self-test verifies private user mappings and cooperative ring-3 task
+  switching, but does not yet provide preemptive scheduling, an init process,
+  interactive userspace, or a stable OS.
 
 ## Freestanding syscall ABI
 
@@ -84,20 +84,22 @@ interrupts enabled. QEMU verification reached the kernel console, observed
 timer and keyboard IRQ activity, and injected an NMI to verify fatal exception
 reporting.
 
-## M3 per-process address-space groundwork (in progress)
+## M3 private address spaces and cooperative scheduling (complete)
 
-Each loaded user image now receives a private PML4 root while retaining the
-kernel mappings needed for syscall and interrupt entry. Its ELF segments, stack,
-and heap occupy private user page tables. Failed loads and exited processes
-reclaim their owned user frames and page-table pages. A boot-time self-test maps
-the same user virtual address in two roots, verifies the contents stay separate,
-and checks that cleanup restores the physical-frame count.
+Each process receives a private PML4 root while retaining the kernel mappings
+needed for syscall and interrupt entry. ELF segments, stacks, and heaps occupy
+private user page tables. Failed loads and exited processes reclaim their owned
+user frames and page-table pages. The cooperative round-robin scheduler saves
+user register state on `yield`, resumes yielded processes, and supports process
+exit and blocking `wait`/child wake-up. Process ID and parent ID queries use the
+process table.
 
-This is not yet a complete process scheduler: execution is still serialized,
-the yield syscall does not save/restore user CPU state, and a spawned child is
-not scheduled until the current process returns to the kernel run loop. User
-fault isolation, preemption, an init process, and a userspace launcher remain
-unfinished.
+At boot, two synthetic ring-3 tasks each verify private data mappings, preserve
+a register across two yields, and exit. QEMU reports
+`M3 scheduler yield/restore: PASS` only after both tasks complete successfully.
+The scheduler is cooperative: a process must yield, exit, or block before
+another process runs. Timer preemption, user-fault isolation, an init process,
+and a userspace launcher remain unfinished.
 
 Run the focused ELF validation tests from the repository root:
 
