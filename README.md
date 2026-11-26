@@ -55,8 +55,12 @@ The freestanding kernel prototype now includes initial M1 execution-path work:
   segments return `EFAULT`.
 - **Physical frames**: builds a free-page list from Limine-reported usable
   memory, zeroes frames on allocation, returns an unused frame if an ELF page
-  cannot be mapped, and reports total/allocated/available frame bytes. General
-  unmapping and process teardown still need to return their frames.
+  cannot be mapped, and reports total/allocated/available frame bytes. Virtual
+  heap allocations can be unmapped and their data frames and empty page-table
+  pages reclaimed; failed multi-page allocations roll back earlier mappings.
+  A boot-time self-test verifies two-page access, rejects duplicate and
+  unaligned frees, checks address reuse, and confirms the allocator returns to
+  its original free-frame count.
 - **Kernel resume/run loop**: runs user processes on a dedicated kernel resume
   stack; `sys_exit` resumes the kernel loop instead of halting.
 - **Process syscall groundwork**: process table, ELF loading, and
@@ -64,9 +68,10 @@ The freestanding kernel prototype now includes initial M1 execution-path work:
   launcher. Active-process spawn/exec and complete lifecycle/reclamation are
   not yet a working isolated process model.
 - **Single-address-space limitation**: the current prototype still has no
-  per-process page tables/isolation or general user-page reclamation. Spawning
-  from an active user process is limited (`ENOTSUP`) to avoid clobbering shared
-  mappings. No init userspace process or bundled demo app is provided.
+  per-process page tables/isolation or process teardown. Heap range reclamation
+  does not provide per-process ownership. Spawning from an active user process
+  is limited (`ENOTSUP`) to avoid clobbering shared mappings. No init userspace
+  process or bundled demo app is provided.
 
 No tiny userspace demo apps are included by default.
 

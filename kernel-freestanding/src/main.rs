@@ -41,6 +41,7 @@ struct Console {
 }
 
 const PAGE_SIZE: u64 = 4096;
+const PAGE_ENTRY_OWNED: u64 = 1 << 9;
 const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
 const USER_DATA_BASE: u64 = USER_CODE_BASE + PAGE_SIZE;
 const USER_REGION_END: u64 = USER_CODE_BASE + 0x0100_0000;
@@ -649,6 +650,9 @@ extern "C" fn kmain() -> ! {
             write_msr(0xC000_0080, efer);
         }
         NX_ENABLED.store(1, Ordering::Release);
+    }
+    if !memory_mapping_self_test() {
+        halt();
     }
 
     let Some(response) = FRAMEBUFFER_REQUEST.get_response() else {
@@ -4284,7 +4288,7 @@ fn align_up_page(value: u64) -> Option<u64> {
         .map(|v| v & !(PAGE_SIZE - 1))
 }
 
-unsafe fn current_pml4() -> *mut u64 {
+unsafe fn current_pml4() -> Option<*mut u64> {
     unsafe {
         let root_physical = {
             let value: u64;
@@ -4292,13 +4296,17 @@ unsafe fn current_pml4() -> *mut u64 {
             value & 0x000F_FFFF_FFFF_F000
         };
         let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
-        (root_physical + hhdm) as *mut u64
+        root_physical
+            .checked_add(hhdm)
+            .map(|root_virtual| root_virtual as *mut u64)
     }
 }
 
 unsafe fn ensure_user_page_mapping(virt: u64) -> bool {
     unsafe {
-        let pml4 = current_pml4();
+        let Some(pml4) = current_pml4() else {
+            return false;
+        };
         let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
         let pd_idx = ((virt >> 21) & 0x1FF) as usize;
@@ -4309,7 +4317,7 @@ unsafe fn ensure_user_page_mapping(virt: u64) -> bool {
             let Some((phys, _)) = allocate_page() else {
                 return false;
             };
-            pml4e = phys | 0x7;
+            pml4e = phys | 0x7 | PAGE_ENTRY_OWNED;
             pml4.add(pml4_idx).write_volatile(pml4e);
         } else if pml4e & 0x4 == 0 {
             pml4.add(pml4_idx).write_volatile(pml4e | 0x4);
@@ -4317,43 +4325,309 @@ unsafe fn ensure_user_page_mapping(virt: u64) -> bool {
         }
 
         let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
-        let pdpt = ((pml4e & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let Some(pdpt_address) = (pml4e & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pdpt = pdpt_address as *mut u64;
         let mut pdpte = pdpt.add(pdpt_idx).read_volatile();
         if pdpte & 1 == 0 {
             let Some((phys, _)) = allocate_page() else {
                 return false;
             };
-            pdpte = phys | 0x7;
+            pdpte = phys | 0x7 | PAGE_ENTRY_OWNED;
             pdpt.add(pdpt_idx).write_volatile(pdpte);
         } else if pdpte & 0x4 == 0 {
             pdpt.add(pdpt_idx).write_volatile(pdpte | 0x4);
             pdpte |= 0x4;
         }
 
-        let pd = ((pdpte & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let Some(pd_address) = (pdpte & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pd = pd_address as *mut u64;
         let mut pde = pd.add(pd_idx).read_volatile();
         if pde & 1 == 0 {
             let Some((phys, _)) = allocate_page() else {
                 return false;
             };
-            pde = phys | 0x7;
+            pde = phys | 0x7 | PAGE_ENTRY_OWNED;
             pd.add(pd_idx).write_volatile(pde);
         } else if pde & 0x4 == 0 {
             pd.add(pd_idx).write_volatile(pde | 0x4);
             pde |= 0x4;
         }
 
-        let pt = ((pde & 0x000F_FFFF_FFFF_F000) + hhdm) as *mut u64;
+        let Some(pt_address) = (pde & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pt = pt_address as *mut u64;
         let pte = pt.add(pt_idx).read_volatile();
         if pte & 1 == 0 {
             let Some((phys, _)) = allocate_page() else {
                 return false;
             };
-            pt.add(pt_idx).write_volatile(phys | 0x7);
+            pt.add(pt_idx)
+                .write_volatile(phys | 0x7 | PAGE_ENTRY_OWNED);
             asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+        } else {
+            return false;
         }
         true
     }
+}
+
+unsafe fn unmap_user_page(virt: u64) -> bool {
+    if !user_page_is_owned(virt) {
+        return false;
+    }
+
+    unsafe {
+        let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
+        let Some(root_address) = page_table_root().checked_add(hhdm) else {
+            return false;
+        };
+        let indexes = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+        let pml4 = root_address as *mut u64;
+        let pml4e = pml4.add(indexes[0]);
+        let pml4_entry = pml4e.read_volatile();
+        if pml4_entry & 0x5 != 0x5 {
+            return false;
+        }
+        let Some(pdpt_address) = (pml4_entry & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pdpt = pdpt_address as *mut u64;
+        let pdpte = pdpt.add(indexes[1]);
+        let pdpt_entry = pdpte.read_volatile();
+        if pdpt_entry & 0x5 != 0x5 || pdpt_entry & (1 << 7) != 0 {
+            return false;
+        }
+        let Some(pd_address) = (pdpt_entry & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pd = pd_address as *mut u64;
+        let pde = pd.add(indexes[2]);
+        let pd_entry = pde.read_volatile();
+        if pd_entry & 0x5 != 0x5 || pd_entry & (1 << 7) != 0 {
+            return false;
+        }
+        let Some(pt_address) = (pd_entry & 0x000F_FFFF_FFFF_F000).checked_add(hhdm) else {
+            return false;
+        };
+        let pt = pt_address as *mut u64;
+        let leaf = pt.add(indexes[3]);
+        let entry = leaf.read_volatile();
+        if entry & 0x5 != 0x5 || entry & PAGE_ENTRY_OWNED == 0 {
+            return false;
+        }
+        let physical = entry & 0x000F_FFFF_FFFF_F000;
+        if physical < 0x10_0000 || physical & (PAGE_SIZE - 1) != 0 {
+            return false;
+        }
+        leaf.write_volatile(0);
+        asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+        if !free_page(physical) {
+            return false;
+        }
+        prune_user_page_tables(virt)
+    }
+}
+
+fn user_page_is_owned(virt: u64) -> bool {
+    if virt & (PAGE_SIZE - 1) != 0 || !user_page_allows_access(virt, false) {
+        return false;
+    }
+
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(root_address) = page_table_root().checked_add(hhdm) else {
+        return false;
+    };
+    let indexes = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+    let mut table = root_address as *const u64;
+    for (level, index) in indexes.into_iter().enumerate() {
+        let entry = unsafe { table.add(index).read_volatile() };
+        if entry & 0x5 != 0x5 {
+            return false;
+        }
+        if level == 3 {
+            return entry & PAGE_ENTRY_OWNED != 0;
+        }
+        if entry & (1 << 7) != 0 {
+            return false;
+        }
+        let physical = entry & 0x000F_FFFF_FFFF_F000;
+        let Some(table_address) = physical.checked_add(hhdm) else {
+            return false;
+        };
+        table = table_address as *const u64;
+    }
+    false
+}
+
+unsafe fn prune_user_page_tables(virt: u64) -> bool {
+    unsafe {
+        let hhdm = core::ptr::addr_of!(HHDM_OFFSET).read_volatile();
+        let Some(root_address) = page_table_root().checked_add(hhdm) else {
+            return false;
+        };
+        let indexes = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+        let pml4e = (root_address as *mut u64).add(indexes[0]);
+        let pml4_entry = pml4e.read_volatile();
+        if pml4_entry & 0x5 != 0x5 || pml4_entry & (1 << 7) != 0 {
+            return true;
+        }
+        let pdpt_physical = pml4_entry & 0x000F_FFFF_FFFF_F000;
+        let Some(pdpt_address) = pdpt_physical.checked_add(hhdm) else {
+            return false;
+        };
+        let pdpt = pdpt_address as *mut u64;
+        let pdpte = pdpt.add(indexes[1]);
+        let pdpt_entry = pdpte.read_volatile();
+        if pdpt_entry & 1 != 0 {
+            if pdpt_entry & 0x4 == 0 || pdpt_entry & (1 << 7) != 0 {
+                return false;
+            }
+            let pd_physical = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+            let Some(pd_address) = pd_physical.checked_add(hhdm) else {
+                return false;
+            };
+            let pd = pd_address as *mut u64;
+            let pde = pd.add(indexes[2]);
+            let pd_entry = pde.read_volatile();
+            if pd_entry & 1 != 0 {
+                if pd_entry & 0x4 == 0 || pd_entry & (1 << 7) != 0 {
+                    return false;
+                }
+                let pt_physical = pd_entry & 0x000F_FFFF_FFFF_F000;
+                let Some(pt_address) = pt_physical.checked_add(hhdm) else {
+                    return false;
+                };
+                let pt = pt_address as *const u64;
+                if page_table_is_empty(pt) && pd_entry & PAGE_ENTRY_OWNED != 0 {
+                    pde.write_volatile(0);
+                    if !free_page(pt_physical) {
+                        return false;
+                    }
+                }
+            }
+            if page_table_is_empty(pd) && pdpt_entry & PAGE_ENTRY_OWNED != 0 {
+                pdpte.write_volatile(0);
+                if !free_page(pd_physical) {
+                    return false;
+                }
+            }
+        }
+        if page_table_is_empty(pdpt) && pml4_entry & PAGE_ENTRY_OWNED != 0 {
+            pml4e.write_volatile(0);
+            if !free_page(pdpt_physical) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+unsafe fn page_table_is_empty(table: *const u64) -> bool {
+    for index in 0..512 {
+        if unsafe { table.add(index).read_volatile() } & 1 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn free_user_virtual_range(address: u64, length: u64) -> Result<(), u64> {
+    lock_kernel();
+    let heap_end = USER_HEAP_NEXT.load(Ordering::Acquire);
+    let Some((_size, end)) =
+        elf::checked_user_unmap_range(address, length, USER_STACK_TOP, heap_end, PAGE_SIZE)
+    else {
+        unlock_kernel();
+        return Err(syscall::EINVAL);
+    };
+
+    let mut virt = address;
+    while virt < end {
+        if !user_page_is_owned(virt) {
+            unlock_kernel();
+            return Err(syscall::EINVAL);
+        }
+        virt += PAGE_SIZE;
+    }
+
+    virt = address;
+    while virt < end {
+        if !unsafe { unmap_user_page(virt) } {
+            unlock_kernel();
+            return Err(syscall::EIO);
+        }
+        virt += PAGE_SIZE;
+    }
+    if end == heap_end {
+        USER_HEAP_NEXT.store(address, Ordering::Release);
+    }
+    unlock_kernel();
+    Ok(())
+}
+
+fn memory_mapping_self_test() -> bool {
+    let before = page_allocator_stats();
+    let allocation = virtual_alloc(0, 2 * PAGE_SIZE, 0);
+    if allocation.error != 0 {
+        return false;
+    }
+
+    let after_allocation = page_allocator_stats();
+    let first = allocation.value as *mut u64;
+    let second = (allocation.value + PAGE_SIZE) as *mut u64;
+    unsafe {
+        first.write_volatile(0xA110_CAFE_0000_0001);
+        second.write_volatile(0xA110_CAFE_0000_0002);
+    }
+    let contents_ok = unsafe {
+        first.read_volatile() == 0xA110_CAFE_0000_0001
+            && second.read_volatile() == 0xA110_CAFE_0000_0002
+    };
+    let released = free_user_virtual_range(allocation.value, 2 * PAGE_SIZE).is_ok();
+    let unmapped = !user_page_is_owned(allocation.value);
+    let after_release = page_allocator_stats();
+    let duplicate_free_rejected =
+        free_user_virtual_range(allocation.value, 2 * PAGE_SIZE) == Err(syscall::EINVAL);
+    let unaligned_free_rejected =
+        free_user_virtual_range(allocation.value + 1, PAGE_SIZE) == Err(syscall::EINVAL);
+    let after_invalid_frees = page_allocator_stats();
+    let reused_allocation = virtual_alloc(0, 2 * PAGE_SIZE, 0);
+    let reused_same_address =
+        reused_allocation.error == 0 && reused_allocation.value == allocation.value;
+    let reused_released = reused_allocation.error == 0
+        && free_user_virtual_range(reused_allocation.value, 2 * PAGE_SIZE).is_ok();
+    contents_ok
+        && released
+        && unmapped
+        && duplicate_free_rejected
+        && unaligned_free_rejected
+        && reused_same_address
+        && reused_released
+        && after_allocation.0 == before.0
+        && after_allocation.1 > before.1
+        && after_release == before
+        && after_invalid_frees == before
+        && page_allocator_stats() == before
 }
 
 fn virtual_alloc(_hint: u64, length: u64, _prot: u64) -> syscall::SyscallResult {
@@ -4378,6 +4652,11 @@ fn virtual_alloc(_hint: u64, length: u64, _prot: u64) -> syscall::SyscallResult 
         let virt = base + i * PAGE_SIZE;
         let ok = unsafe { ensure_user_page_mapping(virt) };
         if !ok {
+            let _ = unsafe { prune_user_page_tables(virt) };
+            for rollback in 0..i {
+                let rollback_virt = base + rollback * PAGE_SIZE;
+                let _ = unsafe { unmap_user_page(rollback_virt) };
+            }
             unlock_kernel();
             return syscall_error(syscall::ENOMEM);
         }
@@ -4390,12 +4669,11 @@ fn virtual_alloc(_hint: u64, length: u64, _prot: u64) -> syscall::SyscallResult 
     }
 }
 
-fn virtual_free(_address: u64, length: u64) -> syscall::SyscallResult {
-    if length == 0 {
-        return syscall_error(syscall::EINVAL);
+fn virtual_free(address: u64, length: u64) -> syscall::SyscallResult {
+    match free_user_virtual_range(address, length) {
+        Ok(()) => syscall::SyscallResult { value: 0, error: 0 },
+        Err(error) => syscall_error(error),
     }
-    // Bump allocator: freeing individual regions is not supported in this kernel.
-    syscall_error(syscall::ENOTSUP)
 }
 
 fn virtual_protect(address: u64, length: u64, _prot: u64) -> syscall::SyscallResult {
@@ -5335,21 +5613,10 @@ fn sys_map_memory(
 }
 
 fn sys_unmap_memory(address: u64, length: u64) -> syscall::SyscallResult {
-    // Bump allocator cannot reclaim individual pages; validate and report success for mapped ranges.
-    if address == 0 || length == 0 {
-        return syscall_error(syscall::EINVAL);
+    match free_user_virtual_range(address, length) {
+        Ok(()) => syscall::SyscallResult { value: 0, error: 0 },
+        Err(error) => syscall_error(error),
     }
-    let Some(size) = align_up_page(length) else {
-        return syscall_error(syscall::EINVAL);
-    };
-    let heap_end = USER_HEAP_NEXT.load(Ordering::Relaxed);
-    let Some(end) = address.checked_add(size) else {
-        return syscall_error(syscall::EINVAL);
-    };
-    if address < USER_CODE_BASE || end > heap_end {
-        return syscall_error(syscall::EINVAL);
-    }
-    syscall::SyscallResult { value: 0, error: 0 }
 }
 
 fn sys_heap_alloc(size: u64, _alignment: u64) -> syscall::SyscallResult {

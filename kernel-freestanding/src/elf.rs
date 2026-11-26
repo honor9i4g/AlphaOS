@@ -54,6 +54,26 @@ pub const fn user_mapping_allows_access(entries: [u64; 4], write: bool) -> bool 
     true
 }
 
+pub fn checked_user_unmap_range(
+    address: u64,
+    length: u64,
+    heap_start: u64,
+    heap_end: u64,
+    page_size: u64,
+) -> Option<(u64, u64)> {
+    if address == 0
+        || length == 0
+        || page_size == 0
+        || !page_size.is_power_of_two()
+        || address & (page_size - 1) != 0
+    {
+        return None;
+    }
+    let size = length.checked_add(page_size - 1)? & !(page_size - 1);
+    let end = address.checked_add(size)?;
+    (address >= heap_start && end <= heap_end).then_some((size, end))
+}
+
 pub fn validate_image(
     image: &[u8],
     user_start: u64,

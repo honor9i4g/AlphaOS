@@ -71,6 +71,30 @@ fn user_mapping_access_requires_present_user_and_write_permissions() {
 }
 
 #[test]
+fn validates_page_aligned_user_unmap_ranges_and_rounds_length_up() {
+    assert_eq!(
+        elf::checked_user_unmap_range(0x5000, 0x1001, 0x4000, 0x8000, 0x1000),
+        Some((0x2000, 0x7000))
+    );
+    assert_eq!(
+        elf::checked_user_unmap_range(0x5001, 0x1000, 0x4000, 0x8000, 0x1000),
+        None
+    );
+    assert_eq!(
+        elf::checked_user_unmap_range(0x3000, 0x1000, 0x4000, 0x8000, 0x1000),
+        None
+    );
+    assert_eq!(
+        elf::checked_user_unmap_range(0x7000, 0x1001, 0x4000, 0x8000, 0x1000),
+        None
+    );
+    assert_eq!(
+        elf::checked_user_unmap_range(u64::MAX - 0xFFF, 0x2000, 0, u64::MAX, 0x1000),
+        None
+    );
+}
+
+#[test]
 fn rejects_truncated_segment_file_data() {
     let mut image = valid_image();
     image.truncate(0x1000);
