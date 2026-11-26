@@ -13,14 +13,16 @@ without losing the existing QEMU-testable shell.
   ring-3/syscall entry, RAMFS, input/framebuffer console, ELF64 loader, and
   M1 app-execution foundations (spawn/exec/wait/exit-to-kernel resume path).
 - **Not yet a full app-capable OS**: running Paint/Calculator-style or
-  third-party apps smoothly still requires major layers: per-process virtual
-  memory/isolation, scheduler/preemption/threading, userspace libc/SDK/toolchain,
+  third-party apps smoothly still requires major layers: a complete
+  process scheduler/preemption/threading model, userspace libc/SDK/toolchain,
   persistent filesystem/storage drivers, richer device/input/graphics drivers,
   windowing/compositor/UI toolkit, IPC/services, packaging, and security
-  hardening.
+  hardening. M3 work has begun on per-process address-space isolation.
 - **Runtime status**: M0 is boot-verified in QEMU: Limine loads the static
-  freestanding ELF and the kernel reaches its framebuffer console. This does
-  not yet prove an interactive userspace, process isolation, or a stable OS.
+  freestanding ELF and the kernel reaches its framebuffer console. The M3
+  boot-time check verifies separate user mappings in two address spaces, but
+  this does not yet prove end-to-end process execution, interactive userspace,
+  or a stable OS.
 
 ## Freestanding syscall ABI
 
@@ -65,13 +67,8 @@ The freestanding kernel prototype now includes initial M1 execution-path work:
   stack; `sys_exit` resumes the kernel loop instead of halting.
 - **Process syscall groundwork**: process table, ELF loading, and
   spawn/exec/wait handlers exist, but there is no init process or userspace
-  launcher. Active-process spawn/exec and complete lifecycle/reclamation are
-  not yet a working isolated process model.
-- **Single-address-space limitation**: the current prototype still has no
-  per-process page tables/isolation or process teardown. Heap range reclamation
-  does not provide per-process ownership. Spawning from an active user process
-  is limited (`ENOTSUP`) to avoid clobbering shared mappings. No init userspace
-  process or bundled demo app is provided.
+  launcher. The initial address-space isolation and teardown work is described
+  under M3 below; it does not yet provide a complete scheduler.
 
 No tiny userspace demo apps are included by default.
 
@@ -86,6 +83,21 @@ IRQ counters confirm both interrupt paths, and the kernel idle loop waits with
 interrupts enabled. QEMU verification reached the kernel console, observed
 timer and keyboard IRQ activity, and injected an NMI to verify fatal exception
 reporting.
+
+## M3 per-process address-space groundwork (in progress)
+
+Each loaded user image now receives a private PML4 root while retaining the
+kernel mappings needed for syscall and interrupt entry. Its ELF segments, stack,
+and heap occupy private user page tables. Failed loads and exited processes
+reclaim their owned user frames and page-table pages. A boot-time self-test maps
+the same user virtual address in two roots, verifies the contents stay separate,
+and checks that cleanup restores the physical-frame count.
+
+This is not yet a complete process scheduler: execution is still serialized,
+the yield syscall does not save/restore user CPU state, and a spawned child is
+not scheduled until the current process returns to the kernel run loop. User
+fault isolation, preemption, an init process, and a userspace launcher remain
+unfinished.
 
 Run the focused ELF validation tests from the repository root:
 

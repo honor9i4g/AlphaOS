@@ -71,6 +71,9 @@ static mut SYSCALL_SAVED_RAX: u64 = 0;
 #[used]
 #[unsafe(no_mangle)]
 static mut KERNEL_RESUME_RSP: u64 = 0;
+#[used]
+#[unsafe(no_mangle)]
+static mut KERNEL_RESUME_CR3: u64 = 0;
 static mut SYSCALL_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut HHDM_OFFSET: u64 = 0;
 static PAGE_FREE_HEAD: AtomicU64 = AtomicU64::new(0);
@@ -229,13 +232,72 @@ impl HeapBlock {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct UserContext {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rsp: u64,
+}
+
+impl UserContext {
+    const fn empty() -> Self {
+        Self {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rsp: 0,
+        }
+    }
+
+    fn set_syscall_result(&mut self, value: u64, error: u64) {
+        self.rax = value;
+        self.rdx = error;
+    }
+}
+
+#[derive(Clone, Copy)]
 struct SpawnedProc {
     used: bool,
     pid: u64,
+    parent_pid: u64,
     exited: bool,
     exit_code: u64,
     ready: bool,
+    blocked: bool,
     entry: u64,
+    address_space_root: u64,
+    heap_next: u64,
+    context: UserContext,
+    context_valid: bool,
+    scheduler_test: bool,
+    wait_pid: u64,
+    wait_status_ptr: u64,
+    waited: bool,
 }
 
 impl SpawnedProc {
@@ -243,10 +305,20 @@ impl SpawnedProc {
         Self {
             used: false,
             pid: 0,
+            parent_pid: 0,
             exited: false,
             exit_code: 0,
             ready: false,
+            blocked: false,
             entry: 0,
+            address_space_root: 0,
+            heap_next: USER_STACK_TOP,
+            context: UserContext::empty(),
+            context_valid: false,
+            scheduler_test: false,
+            wait_pid: 0,
+            wait_status_ptr: 0,
+            waited: false,
         }
     }
 }
@@ -256,10 +328,18 @@ static mut FS_INIT: bool = false;
 static mut OPEN_FILES: [OpenFile; MAX_OPEN_FILES] = [OpenFile::empty(); MAX_OPEN_FILES];
 static mut HEAP_BLOCKS: [HeapBlock; MAX_HEAP_BLOCKS] = [HeapBlock::empty(); MAX_HEAP_BLOCKS];
 static mut SPAWNED: [SpawnedProc; MAX_SPAWNED] = [SpawnedProc::empty(); MAX_SPAWNED];
+static mut SCHEDULER_CURSOR: usize = MAX_SPAWNED - 1;
 static NEXT_SPAWN_PID: AtomicU64 = AtomicU64::new(2);
 static CURRENT_PID: AtomicU64 = AtomicU64::new(0);
 static EXIT_STATUS: AtomicU64 = AtomicU64::new(0);
 static EXITED: AtomicU8 = AtomicU8::new(0);
+static SCHEDULER_TEST_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static SCHEDULER_TEST_EXITS: AtomicU64 = AtomicU64::new(0);
+static SCHEDULER_TEST_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[used]
+#[unsafe(no_mangle)]
+static mut SYSCALL_USER_CONTEXT: UserContext = UserContext::empty();
 
 const MAX_ENV_VARS: usize = 16;
 const MAX_ENV_KEY: usize = 32;
@@ -417,6 +497,9 @@ global_asm!(
     "push r14",
     "push r15",
     "mov qword ptr [rip + KERNEL_RESUME_RSP], rsp",
+    "mov rax, cr3",
+    "mov qword ptr [rip + KERNEL_RESUME_CR3], rax",
+    "mov cr3, rdx",
     "mov ax, 0x1b",
     "mov ds, ax",
     "mov es, ax",
@@ -427,6 +510,58 @@ global_asm!(
     "push 0x202",
     "push 0x23",
     "push rax",
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor ebp, ebp",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "xor r12d, r12d",
+    "xor r13d, r13d",
+    "xor r14d, r14d",
+    "xor r15d, r15d",
+    "iretq",
+    ".global resume_user_with_context",
+    "resume_user_with_context:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov qword ptr [rip + KERNEL_RESUME_RSP], rsp",
+    "mov rax, cr3",
+    "mov qword ptr [rip + KERNEL_RESUME_CR3], rax",
+    "mov cr3, rsi",
+    "mov rbx, rdi",
+    "push 0x1b",
+    "push qword ptr [rbx + 120]",
+    "push qword ptr [rbx + 80]",
+    "push 0x23",
+    "push qword ptr [rbx + 16]",
+    "mov ax, 0x1b",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov rax, qword ptr [rbx]",
+    "mov rcx, qword ptr [rbx + 16]",
+    "mov rdx, qword ptr [rbx + 24]",
+    "mov rsi, qword ptr [rbx + 32]",
+    "mov rdi, qword ptr [rbx + 40]",
+    "mov rbp, qword ptr [rbx + 48]",
+    "mov r8, qword ptr [rbx + 56]",
+    "mov r9, qword ptr [rbx + 64]",
+    "mov r10, qword ptr [rbx + 72]",
+    "mov r11, qword ptr [rbx + 80]",
+    "mov r12, qword ptr [rbx + 88]",
+    "mov r13, qword ptr [rbx + 96]",
+    "mov r14, qword ptr [rbx + 104]",
+    "mov r15, qword ptr [rbx + 112]",
+    "mov rbx, qword ptr [rbx + 8]",
     "iretq",
     ".global start_kernel_on_resume_stack",
     "start_kernel_on_resume_stack:",
@@ -442,6 +577,8 @@ global_asm!(
     "mov ds, ax",
     "mov es, ax",
     "mov ss, ax",
+    "mov rax, qword ptr [rip + KERNEL_RESUME_CR3]",
+    "mov cr3, rax",
     "mov rsp, qword ptr [rip + KERNEL_RESUME_RSP]",
     "pop r15",
     "pop r14",
@@ -453,6 +590,22 @@ global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     "mov qword ptr [rip + SYSCALL_USER_STACK], rsp",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT], rax",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 8], rbx",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 16], rcx",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 24], rdx",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 32], rsi",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 40], rdi",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 48], rbp",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 56], r8",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 64], r9",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 72], r10",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 80], r11",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 88], r12",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 96], r13",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 104], r14",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 112], r15",
+    "mov qword ptr [rip + SYSCALL_USER_CONTEXT + 120], rsp",
     "mov rsp, qword ptr [rip + SYSCALL_KERNEL_STACK_TOP]",
     "mov qword ptr [rip + SYSCALL_SAVED_RAX], rax",
     "mov ax, 0x10",
@@ -624,16 +777,49 @@ global_asm!(
     "jmp 3b",
     ".global user_test_end",
     "user_test_end:",
+    ".global scheduler_test_start",
+    "scheduler_test_start:",
+    "mov rsi, 0x0000400000001000",
+    "cmp dword ptr [rsi], 0",
+    "jne 4f",
+    "mov dword ptr [rsi], 1",
+    "mov r12, 0x13572468",
+    "mov rax, 103",
+    "syscall",
+    "cmp r12, 0x13572468",
+    "jne 4f",
+    "cmp dword ptr [rsi], 1",
+    "jne 4f",
+    "mov dword ptr [rsi], 2",
+    "mov rax, 103",
+    "syscall",
+    "cmp r12, 0x13572468",
+    "jne 4f",
+    "cmp dword ptr [rsi], 2",
+    "jne 4f",
+    "xor rdi, rdi",
+    "jmp 5f",
+    "4:",
+    "mov rdi, 1",
+    "5:",
+    "xor rax, rax",
+    "syscall",
+    "6: jmp 6b",
+    ".global scheduler_test_end",
+    "scheduler_test_end:",
 );
 
 unsafe extern "C" {
     fn enter_user_mode(instruction_pointer: u64, stack_pointer: u64) -> !;
-    fn run_user_with_resume(instruction_pointer: u64, stack_pointer: u64);
+    fn run_user_with_resume(instruction_pointer: u64, stack_pointer: u64, address_space_root: u64);
+    fn resume_user_with_context(context: *const UserContext, address_space_root: u64);
     fn kernel_exit_resume() -> !;
     fn start_kernel_on_resume_stack() -> !;
     fn syscall_entry();
     static user_test_start: u8;
     static user_test_end: u8;
+    static scheduler_test_start: u8;
+    static scheduler_test_end: u8;
 }
 
 #[unsafe(no_mangle)]
@@ -652,6 +838,9 @@ extern "C" fn kmain() -> ! {
         NX_ENABLED.store(1, Ordering::Release);
     }
     if !memory_mapping_self_test() {
+        halt();
+    }
+    if !address_space_isolation_self_test() {
         halt();
     }
 
@@ -732,6 +921,10 @@ extern "C" fn kmain() -> ! {
     }
     input::set_foreground_target(Some(USER_INPUT_TARGET));
     interrupts::enable_keyboard_irq();
+    if !queue_scheduler_self_test() {
+        draw_scheduler_test_status(false);
+        halt();
+    }
     unsafe {
         start_kernel_on_resume_stack();
     }
@@ -752,40 +945,98 @@ extern "C" fn kernel_run_loop() {
             draw_irq_status("PS/2 keyboard IRQ1: active", 56);
             keyboard_status_drawn = true;
         }
-        let mut found: Option<(usize, u64, u64)> = None;
+        let mut found: Option<(usize, SpawnedProc)> = None;
         lock_kernel();
         unsafe {
-            for i in 0..MAX_SPAWNED {
+            let cursor = core::ptr::addr_of!(SCHEDULER_CURSOR).read_volatile();
+            for offset in 1..=MAX_SPAWNED {
+                let i = (cursor + offset) % MAX_SPAWNED;
                 let p = *core::ptr::addr_of!(SPAWNED[i]);
                 if p.used && p.ready && !p.exited {
-                    found = Some((i, p.pid, p.entry));
+                    found = Some((i, p));
                     (*core::ptr::addr_of_mut!(SPAWNED[i])).ready = false;
+                    core::ptr::addr_of_mut!(SCHEDULER_CURSOR).write_volatile(i);
                     break;
                 }
             }
         }
         unlock_kernel();
 
-        if let Some((_slot, pid, entry)) = found {
-            CURRENT_PID.store(pid, Ordering::Relaxed);
+        if let Some((slot, process)) = found {
+            CURRENT_PID.store(process.pid, Ordering::Relaxed);
             EXITED.store(0, Ordering::Relaxed);
             EXIT_STATUS.store(0, Ordering::Relaxed);
+            USER_HEAP_NEXT.store(process.heap_next, Ordering::Release);
             configure_syscall_entry();
-            unsafe { run_user_with_resume(entry, USER_STACK_TOP); }
+            unsafe {
+                if process.context_valid {
+                    resume_user_with_context(&process.context, process.address_space_root);
+                } else {
+                    run_user_with_resume(
+                        process.entry,
+                        USER_STACK_TOP,
+                        process.address_space_root,
+                    );
+                }
+            }
             let exit_code = EXIT_STATUS.load(Ordering::Relaxed);
             lock_kernel();
             let mut still_ready = false;
+            let mut root_to_free = 0;
+            let mut self_test_finished = false;
             unsafe {
-                for i in 0..MAX_SPAWNED {
-                    let p = *core::ptr::addr_of!(SPAWNED[i]);
-                    if p.used && p.pid == pid {
-                        if p.ready {
-                            still_ready = true;
-                        } else if !p.exited {
-                            let slot = &mut *core::ptr::addr_of_mut!(SPAWNED[i]);
-                            slot.exited = true;
-                            slot.exit_code = exit_code;
+                let proc = &mut *core::ptr::addr_of_mut!(SPAWNED[slot]);
+                if proc.used && proc.pid == process.pid {
+                    if proc.ready {
+                        still_ready = true;
+                    } else if !proc.blocked && !proc.exited {
+                        proc.exited = true;
+                        proc.exit_code = exit_code;
+                    }
+                    if proc.address_space_root != process.address_space_root {
+                        root_to_free = process.address_space_root;
+                    } else if proc.exited {
+                        root_to_free = proc.address_space_root;
+                        proc.address_space_root = 0;
+                    } else {
+                        proc.heap_next = USER_HEAP_NEXT.load(Ordering::Acquire);
+                    }
+                    if proc.exited && proc.parent_pid != 0 {
+                        for parent_index in 0..MAX_SPAWNED {
+                            let parent =
+                                &mut *core::ptr::addr_of_mut!(SPAWNED[parent_index]);
+                            if !parent.used
+                                || parent.pid != proc.parent_pid
+                                || !parent.blocked
+                                || (parent.wait_pid != 0 && parent.wait_pid != proc.pid)
+                            {
+                                continue;
+                            }
+                            let mut context = parent.context;
+                            let status_written = parent.wait_status_ptr == 0
+                                || write_user_u64_in_root(
+                                    parent.address_space_root,
+                                    parent.wait_status_ptr,
+                                    proc.exit_code,
+                                );
+                            if status_written {
+                                context.set_syscall_result(proc.pid, 0);
+                            } else {
+                                context.set_syscall_result(0, syscall::EFAULT);
+                            }
+                            parent.context = context;
+                            parent.context_valid = true;
+                            parent.blocked = false;
+                            parent.ready = true;
+                            parent.wait_pid = 0;
+                            parent.wait_status_ptr = 0;
+                            proc.waited = true;
+                            break;
                         }
+                    }
+                    if proc.scheduler_test && proc.exited {
+                        proc.scheduler_test = false;
+                        self_test_finished = true;
                     }
                 }
             }
@@ -793,6 +1044,41 @@ extern "C" fn kernel_run_loop() {
                 CURRENT_PID.store(0, Ordering::Relaxed);
             }
             unlock_kernel();
+            if root_to_free != 0 && !unsafe { free_user_address_space(root_to_free) } {
+                halt();
+            }
+            if !self_test_finished {
+                lock_kernel();
+                unsafe {
+                    let proc = &mut *core::ptr::addr_of_mut!(SPAWNED[slot]);
+                    if proc.used
+                        && proc.pid == process.pid
+                        && proc.exited
+                        && proc.waited
+                    {
+                        *proc = SpawnedProc::empty();
+                        PROC_NAMES[slot] = [0; MAX_PROC_NAME];
+                        PROC_NAME_LENS[slot] = 0;
+                    }
+                }
+                unlock_kernel();
+            }
+            if self_test_finished {
+                if exit_code != 0 {
+                    SCHEDULER_TEST_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                unsafe {
+                    lock_kernel();
+                    (*core::ptr::addr_of_mut!(SPAWNED[slot])) = SpawnedProc::empty();
+                    unlock_kernel();
+                }
+                let completed = SCHEDULER_TEST_EXITS.fetch_add(1, Ordering::AcqRel) + 1;
+                if completed == 2 {
+                    let passed = SCHEDULER_TEST_FAILURES.load(Ordering::Acquire) == 0
+                        && SCHEDULER_TEST_SWITCHES.load(Ordering::Acquire) >= 4;
+                    draw_scheduler_test_status(passed);
+                }
+            }
         } else {
             interrupts::wait_for_interrupt();
         }
@@ -817,6 +1103,34 @@ fn draw_irq_status(text: &str, y: usize) {
         0x40,
         0xFF,
         0x80,
+    );
+}
+
+fn draw_scheduler_test_status(passed: bool) {
+    let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
+    if console.is_null() {
+        return;
+    }
+    let console = unsafe { &*console };
+    let (text, red, green) = if passed {
+        ("M3 scheduler yield/restore: PASS", 0x40, 0xFF)
+    } else {
+        ("M3 scheduler yield/restore: FAIL", 0xFF, 0x40)
+    };
+    debug_write(text);
+    debug_write("\n");
+    draw_text(
+        console.address,
+        console.width,
+        console.height,
+        console.pitch,
+        console.pixel_format,
+        Console::LEFT,
+        72,
+        text,
+        red,
+        green,
+        0x40,
     );
 }
 
@@ -1355,10 +1669,43 @@ fn page_table_root() -> u64 {
     }
 }
 
-unsafe fn map_user_page(va: u64, phys: u64, segment_flags: u32) -> bool {
+fn create_user_address_space() -> Result<u64, u64> {
+    let source_root = page_table_root();
     let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
-    let root = page_table_root();
-    let Some(root_va) = root.checked_add(hhdm) else { return false; };
+    let Some(source_virtual) = source_root.checked_add(hhdm) else {
+        return Err(syscall::ENOMEM);
+    };
+    let Some((root, root_virtual)) = (unsafe { allocate_page() }) else {
+        return Err(syscall::ENOMEM);
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            source_virtual as *const u64,
+            root_virtual.cast::<u64>(),
+            512,
+        );
+    }
+
+    let user_pml4_index = ((USER_CODE_BASE >> 39) & 0x1FF) as usize;
+    unsafe {
+        root_virtual
+            .cast::<u64>()
+            .add(user_pml4_index)
+            .write_volatile(0);
+    }
+    Ok(root)
+}
+
+unsafe fn map_user_page_in_root(
+    root: u64,
+    va: u64,
+    phys: u64,
+    segment_flags: u32,
+) -> bool {
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(root_va) = root.checked_add(hhdm) else {
+        return false;
+    };
     let pml4 = root_va as *mut u64;
     let idx4 = ((va >> 39) & 0x1FF) as usize;
     let idx3 = ((va >> 30) & 0x1FF) as usize;
@@ -1378,7 +1725,7 @@ unsafe fn map_user_page(va: u64, phys: u64, segment_flags: u32) -> bool {
             return Some(phys.checked_add(hhdm)? as *mut u64);
         }
         let (phys, virt) = unsafe { allocate_page()? };
-        unsafe { entry_ptr.write_volatile(phys | 0x7); }
+        unsafe { entry_ptr.write_volatile(phys | 0x7 | PAGE_ENTRY_OWNED); }
         Some(virt as *mut u64)
     }
 
@@ -1394,15 +1741,183 @@ unsafe fn map_user_page(va: u64, phys: u64, segment_flags: u32) -> bool {
     );
     unsafe {
         pt.add(idx1)
-            .write_volatile((phys & 0x000F_FFFF_FFFF_F000) | page_flags);
-    }
-    unsafe {
-        asm!("invlpg [{}]", in(reg) va as usize, options(nostack, preserves_flags));
+            .write_volatile((phys & 0x000F_FFFF_FFFF_F000) | page_flags | PAGE_ENTRY_OWNED);
     }
     true
 }
 
-fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
+unsafe fn free_user_page_table_tree(table_phys: u64, level: usize, hhdm: u64) -> bool {
+    let Some(table_virtual) = table_phys.checked_add(hhdm) else {
+        return false;
+    };
+    let table = table_virtual as *mut u64;
+    for index in 0..512 {
+        let entry_ptr = unsafe { table.add(index) };
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if entry & 1 == 0 {
+            continue;
+        }
+        let child_phys = entry & 0x000F_FFFF_FFFF_F000;
+        if level == 1 {
+            if entry & PAGE_ENTRY_OWNED == 0 {
+                return false;
+            }
+            unsafe { entry_ptr.write_volatile(0) };
+            if !unsafe { free_page(child_phys) } {
+                return false;
+            }
+        } else {
+            if entry & (1 << 7) != 0 || entry & PAGE_ENTRY_OWNED == 0 {
+                return false;
+            }
+            if !unsafe { free_user_page_table_tree(child_phys, level - 1, hhdm) } {
+                return false;
+            }
+            unsafe { entry_ptr.write_volatile(0) };
+            if !unsafe { free_page(child_phys) } {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+unsafe fn free_user_address_space(root: u64) -> bool {
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(root_virtual) = root.checked_add(hhdm) else {
+        return false;
+    };
+    let root_table = root_virtual as *mut u64;
+    let user_pml4_index = ((USER_CODE_BASE >> 39) & 0x1FF) as usize;
+    let user_entry = unsafe { root_table.add(user_pml4_index).read_volatile() };
+    if user_entry & 1 != 0 {
+        if user_entry & PAGE_ENTRY_OWNED == 0
+            || user_entry & (1 << 7) != 0
+            || !unsafe {
+                free_user_page_table_tree(
+                    user_entry & 0x000F_FFFF_FFFF_F000,
+                    3,
+                    hhdm,
+                )
+            }
+        {
+            return false;
+        }
+        unsafe {
+            root_table.add(user_pml4_index).write_volatile(0);
+        }
+        if !unsafe { free_page(user_entry & 0x000F_FFFF_FFFF_F000) } {
+            return false;
+        }
+    }
+    unsafe { free_page(root) }
+}
+
+fn translate_user_address_in_root(root: u64, address: u64, write: bool) -> Option<u64> {
+    if root == 0 || address >= 0x0000_8000_0000_0000 {
+        return None;
+    }
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let root_virtual = root.checked_add(hhdm)?;
+    let indexes = [
+        ((address >> 39) & 0x1FF) as usize,
+        ((address >> 30) & 0x1FF) as usize,
+        ((address >> 21) & 0x1FF) as usize,
+        ((address >> 12) & 0x1FF) as usize,
+    ];
+    let mut table = root_virtual as *const u64;
+    for (level, index) in indexes.into_iter().enumerate() {
+        let entry = unsafe { table.add(index).read_volatile() };
+        if entry & 0x5 != 0x5 || (write && entry & 0x2 == 0) {
+            return None;
+        }
+        if level == indexes.len() - 1 {
+            return (entry & 0x000F_FFFF_FFFF_F000)
+                .checked_add(address & (PAGE_SIZE - 1));
+        }
+        if entry & (1 << 7) != 0 {
+            return None;
+        }
+        let table_physical = entry & 0x000F_FFFF_FFFF_F000;
+        table = table_physical.checked_add(hhdm)? as *const u64;
+    }
+    None
+}
+
+fn write_user_u64_in_root(root: u64, address: u64, value: u64) -> bool {
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    for (offset, byte) in value.to_le_bytes().iter().enumerate() {
+        let Some(physical) =
+            translate_user_address_in_root(root, address.saturating_add(offset as u64), true)
+        else {
+            return false;
+        };
+        let Some(virtual_address) = physical.checked_add(hhdm) else {
+            return false;
+        };
+        unsafe {
+            (virtual_address as *mut u8).write_volatile(*byte);
+        }
+    }
+    true
+}
+
+fn address_space_isolation_self_test() -> bool {
+    let before = page_allocator_stats();
+    let Ok(root_a) = create_user_address_space() else {
+        return false;
+    };
+    let Ok(root_b) = create_user_address_space() else {
+        let freed = unsafe { free_user_address_space(root_a) };
+        return freed && page_allocator_stats() == before;
+    };
+    let Some((frame_a, _)) = (unsafe { allocate_page() }) else {
+        let freed_a = unsafe { free_user_address_space(root_a) };
+        let freed_b = unsafe { free_user_address_space(root_b) };
+        let freed = freed_a && freed_b;
+        return freed && page_allocator_stats() == before;
+    };
+    let Some((frame_b, _)) = (unsafe { allocate_page() }) else {
+        let frame_freed = unsafe { free_page(frame_a) };
+        let freed_a = unsafe { free_user_address_space(root_a) };
+        let freed_b = unsafe { free_user_address_space(root_b) };
+        let freed = frame_freed && freed_a && freed_b;
+        return freed && page_allocator_stats() == before;
+    };
+
+    let mapped_a = unsafe { map_user_page_in_root(root_a, USER_DATA_BASE, frame_a, 2) };
+    let mapped_b = mapped_a
+        && unsafe { map_user_page_in_root(root_b, USER_DATA_BASE, frame_b, 2) };
+    if !mapped_a || !mapped_b {
+        if !mapped_a {
+            let _ = unsafe { free_page(frame_a) };
+        }
+        let _ = unsafe { free_page(frame_b) };
+        let freed_a = unsafe { free_user_address_space(root_a) };
+        let freed_b = unsafe { free_user_address_space(root_b) };
+        return freed_a && freed_b && page_allocator_stats() == before;
+    }
+
+    let kernel_root = page_table_root();
+    let isolated = unsafe {
+        asm!("mov cr3, {}", in(reg) root_a, options(nostack, preserves_flags));
+        (USER_DATA_BASE as *mut u64).write_volatile(0xA110_CAFE_0000_0001);
+        asm!("mov cr3, {}", in(reg) root_b, options(nostack, preserves_flags));
+        (USER_DATA_BASE as *mut u64).write_volatile(0xA110_CAFE_0000_0002);
+        asm!("mov cr3, {}", in(reg) root_a, options(nostack, preserves_flags));
+        let value_a = (USER_DATA_BASE as *const u64).read_volatile();
+        asm!("mov cr3, {}", in(reg) root_b, options(nostack, preserves_flags));
+        let value_b = (USER_DATA_BASE as *const u64).read_volatile();
+        asm!("mov cr3, {}", in(reg) kernel_root, options(nostack, preserves_flags));
+        value_a == 0xA110_CAFE_0000_0001 && value_b == 0xA110_CAFE_0000_0002
+    };
+    let freed_a = unsafe { free_user_address_space(root_a) };
+    let freed_b = unsafe { free_user_address_space(root_b) };
+    let freed = freed_a && freed_b;
+    isolated && freed && page_allocator_stats() == before
+}
+
+fn load_user_elf(path: &[u8]) -> Result<(u64, u64), u64> {
     init_fs();
     let Some(idx) = fs_find(path) else { return Err(syscall::ENOENT); };
     let (size, data_ptr) = unsafe { (FS_FILES[idx].size, FS_FILES[idx].data.as_ptr()) };
@@ -1414,6 +1929,20 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
         }
     })?;
 
+    let root = create_user_address_space()?;
+    match load_user_elf_into(root, image, plan) {
+        Ok(entry) => Ok((entry, root)),
+        Err(error) => {
+            if !unsafe { free_user_address_space(root) } {
+                Err(syscall::EIO)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn load_user_elf_into(root: u64, image: &[u8], plan: elf::LoadPlan) -> Result<u64, u64> {
     for index in 0..plan.program_header_count {
         let segment = elf::program_header(image, plan, index).map_err(|_| syscall::ENOEXEC)?;
         if segment.kind != 1 || segment.memory_size == 0 {
@@ -1435,7 +1964,7 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
             let Some((physical, _)) = (unsafe { allocate_page() }) else {
                 return Err(syscall::ENOMEM);
             };
-            if !unsafe { map_user_page(page_address, physical, segment.flags) } {
+            if !unsafe { map_user_page_in_root(root, page_address, physical, segment.flags) } {
                 let _ = unsafe { free_page(physical) };
                 return Err(syscall::ENOMEM);
             }
@@ -1476,7 +2005,7 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
         let Some((physical, _)) = (unsafe { allocate_page() }) else {
             return Err(syscall::ENOMEM);
         };
-        if !unsafe { map_user_page(stack_address, physical, 2) } {
+        if !unsafe { map_user_page_in_root(root, stack_address, physical, 2) } {
             let _ = unsafe { free_page(physical) };
             return Err(syscall::ENOMEM);
         }
@@ -1486,10 +2015,126 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
     Ok(plan.entry)
 }
 
-fn try_exec_user_program(path: &[u8]) -> Result<u64, u64> {
-    let entry = load_user_elf(path)?;
+fn create_scheduler_test_address_space() -> Result<u64, u64> {
+    let code_start = core::ptr::addr_of!(scheduler_test_start);
+    let code_end = core::ptr::addr_of!(scheduler_test_end);
+    let code_length = code_end as usize - code_start as usize;
+    if code_length == 0 || code_length > PAGE_SIZE as usize {
+        return Err(syscall::ENOEXEC);
+    }
+
+    let root = create_user_address_space()?;
+    let result = (|| -> Result<(), u64> {
+        let Some((code_physical, code_page)) = (unsafe { allocate_page() }) else {
+            return Err(syscall::ENOMEM);
+        };
+        if !unsafe { map_user_page_in_root(root, USER_CODE_BASE, code_physical, 5) } {
+            let _ = unsafe { free_page(code_physical) };
+            return Err(syscall::ENOMEM);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(code_start, code_page, code_length);
+        }
+
+        for address in core::iter::once(USER_DATA_BASE)
+            .chain((USER_STACK_BASE..USER_STACK_TOP).step_by(PAGE_SIZE as usize))
+        {
+            let Some((physical, _)) = (unsafe { allocate_page() }) else {
+                return Err(syscall::ENOMEM);
+            };
+            if !unsafe { map_user_page_in_root(root, address, physical, 2) } {
+                let _ = unsafe { free_page(physical) };
+                return Err(syscall::ENOMEM);
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(root),
+        Err(error) => {
+            if !unsafe { free_user_address_space(root) } {
+                Err(syscall::EIO)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn queue_scheduler_self_test() -> bool {
+    let root_a = match create_scheduler_test_address_space() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let root_b = match create_scheduler_test_address_space() {
+        Ok(root) => root,
+        Err(_) => {
+            return unsafe { free_user_address_space(root_a) };
+        }
+    };
+
+    lock_kernel();
+    let mut free_slots = [usize::MAX; 2];
+    let mut found = 0;
+    unsafe {
+        for index in 0..MAX_SPAWNED {
+            if !SPAWNED[index].used {
+                free_slots[found] = index;
+                found += 1;
+                if found == free_slots.len() {
+                    break;
+                }
+            }
+        }
+    }
+    if found != free_slots.len() {
+        unlock_kernel();
+        let freed_a = unsafe { free_user_address_space(root_a) };
+        let freed_b = unsafe { free_user_address_space(root_b) };
+        return freed_a && freed_b;
+    }
+
+    let roots = [root_a, root_b];
+    let names: [&[u8]; 2] = [b"m3-yield-a", b"m3-yield-b"];
+    unsafe {
+        for index in 0..free_slots.len() {
+            let slot = free_slots[index];
+            let pid = NEXT_SPAWN_PID.fetch_add(1, Ordering::Relaxed);
+            SPAWNED[slot] = SpawnedProc {
+                used: true,
+                pid,
+                parent_pid: 0,
+                exited: false,
+                exit_code: 0,
+                ready: true,
+                blocked: false,
+                entry: USER_CODE_BASE,
+                address_space_root: roots[index],
+                heap_next: USER_STACK_TOP,
+                context: UserContext::empty(),
+                context_valid: false,
+                scheduler_test: true,
+                wait_pid: 0,
+                wait_status_ptr: 0,
+                waited: false,
+            };
+            PROC_NAMES[slot] = [0; MAX_PROC_NAME];
+            PROC_NAMES[slot][..names[index].len()].copy_from_slice(names[index]);
+            PROC_NAME_LENS[slot] = names[index].len();
+        }
+    }
+    SCHEDULER_TEST_SWITCHES.store(0, Ordering::Relaxed);
+    SCHEDULER_TEST_EXITS.store(0, Ordering::Relaxed);
+    SCHEDULER_TEST_FAILURES.store(0, Ordering::Relaxed);
+    unlock_kernel();
+    true
+}
+
+fn try_exec_user_program(path: &[u8]) -> Result<(u64, u64), u64> {
+    let program = load_user_elf(path)?;
     configure_syscall_entry();
-    Ok(entry)
+    Ok(program)
 }
 
 type SyscallResult = syscall::SyscallResult;
@@ -2043,9 +2688,62 @@ fn sys_stat_handle(handle: u64, stat_ptr: u64) -> syscall::SyscallResult {
     match sc_copy_to_user(stat_ptr, bytes.len() as u64, bytes) { Ok(_)=>syscall::SyscallResult::success(0), Err(e)=>syscall_error(e) }
 }
 
-fn syscall_getppid() -> syscall::SyscallResult { syscall::SyscallResult::success(0) }
-fn syscall_gettid() -> syscall::SyscallResult { syscall::SyscallResult::success(1) }
-fn syscall_sched_yield() -> syscall::SyscallResult { unsafe { core::arch::asm!("pause"); } syscall::SyscallResult::success(0) }
+fn syscall_getppid() -> syscall::SyscallResult {
+    let pid = CURRENT_PID.load(Ordering::Acquire);
+    for index in 0..MAX_SPAWNED {
+        let process = unsafe { SPAWNED[index] };
+        if process.used && process.pid == pid {
+            return syscall::SyscallResult::success(process.parent_pid);
+        }
+    }
+    syscall::SyscallResult::success(0)
+}
+
+fn syscall_gettid() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(CURRENT_PID.load(Ordering::Acquire).max(1))
+}
+fn syscall_sched_yield() -> syscall::SyscallResult {
+    let pid = CURRENT_PID.load(Ordering::Acquire);
+    if pid == 0 {
+        return syscall::SyscallResult::success(0);
+    }
+
+    let mut context = unsafe {
+        core::ptr::addr_of!(SYSCALL_USER_CONTEXT).read_volatile()
+    };
+    context.set_syscall_result(0, 0);
+
+    lock_kernel();
+    let mut current_slot = None;
+    let mut another_ready = false;
+    unsafe {
+        for index in 0..MAX_SPAWNED {
+            let process = *core::ptr::addr_of!(SPAWNED[index]);
+            if process.used && process.pid == pid && !process.exited {
+                current_slot = Some(index);
+            } else if process.used && process.ready && !process.exited {
+                another_ready = true;
+            }
+        }
+    }
+    let Some(slot) = current_slot else {
+        unlock_kernel();
+        return syscall_error(syscall::ESRCH);
+    };
+
+    unsafe {
+        let process = &mut *core::ptr::addr_of_mut!(SPAWNED[slot]);
+        process.context = context;
+        process.context_valid = true;
+        process.ready = true;
+        if process.scheduler_test && another_ready {
+            SCHEDULER_TEST_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    unlock_kernel();
+
+    unsafe { kernel_exit_resume() }
+}
 fn syscall_set_process_name(name_ptr: u64, name_len: u64) -> syscall::SyscallResult {
     let name = match sc_read_user(name_ptr, name_len) { Ok(s)=>s, Err(e)=>{sc_set_last_error(e); return syscall_error(e);} };
     let n = core::cmp::min(name.len(), 31);
@@ -2076,8 +2774,8 @@ fn syscall_exec(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sy
         return syscall_error(syscall::EFAULT);
     };
     let path = &path_buf[..n];
-    let entry = match load_user_elf(path) {
-        Ok(e) => e,
+    let (entry, address_space_root) = match load_user_elf(path) {
+        Ok(program) => program,
         Err(err) => return syscall_error(err),
     };
 
@@ -2102,18 +2800,36 @@ fn syscall_exec(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sy
     }
     let Some(slot) = slot else {
         unlock_kernel();
+        if !unsafe { free_user_address_space(address_space_root) } {
+            halt();
+        }
         return syscall_error(syscall::EAGAIN);
     };
 
     let pid = if current_pid != 0 { current_pid } else { NEXT_SPAWN_PID.fetch_add(1, Ordering::Relaxed) };
+    let parent_pid = if current_pid != 0 {
+        unsafe { SPAWNED[slot].parent_pid }
+    } else {
+        1
+    };
     unsafe {
         SPAWNED[slot] = SpawnedProc {
             used: true,
             pid,
+            parent_pid,
             exited: false,
             exit_code: 0,
             ready: true,
+            blocked: false,
             entry,
+            address_space_root,
+            heap_next: USER_STACK_TOP,
+            context: UserContext::empty(),
+            context_valid: false,
+            scheduler_test: false,
+            wait_pid: 0,
+            wait_status_ptr: 0,
+            waited: false,
         };
         let name_len = core::cmp::min(n, MAX_PROC_NAME);
         PROC_NAMES[slot][..name_len].copy_from_slice(&path_buf[..name_len]);
@@ -2153,7 +2869,9 @@ fn syscall_process_exists(pid: u64) -> syscall::SyscallResult {
 }
 fn syscall_get_process_list(buf_ptr: u64, max_entries: u64) -> syscall::SyscallResult { syscall_list_processes(buf_ptr, max_entries.saturating_mul(4)) }
 fn syscall_kill_thread(tid: u64) -> syscall::SyscallResult { syscall_kill_process(tid, 9) }
-fn syscall_get_current_tid() -> syscall::SyscallResult { syscall::SyscallResult::success(1) }
+fn syscall_get_current_tid() -> syscall::SyscallResult {
+    syscall::SyscallResult::success(CURRENT_PID.load(Ordering::Acquire).max(1))
+}
 fn syscall_set_uid(uid: u64) -> syscall::SyscallResult { unsafe { *core::ptr::addr_of_mut!(SC_UID)=uid as u32; } syscall::SyscallResult::success(0) }
 fn syscall_get_uid() -> syscall::SyscallResult { syscall::SyscallResult::success(unsafe { *core::ptr::addr_of!(SC_UID) } as u64) }
 fn syscall_set_gid(gid: u64) -> syscall::SyscallResult { unsafe { *core::ptr::addr_of_mut!(SC_GID)=gid as u32; } syscall::SyscallResult::success(0) }
@@ -3809,7 +4527,10 @@ extern "C" fn syscall_dispatch(
                 | u64::from(syscall::SYSCALL_ABI_MINOR),
             error: 0,
         },
-        Some(syscall::SyscallId::GetPid) => syscall::SyscallResult { value: 1, error: 0 },
+        Some(syscall::SyscallId::GetPid) => syscall::SyscallResult {
+            value: CURRENT_PID.load(Ordering::Acquire).max(1),
+            error: 0,
+        },
         Some(syscall::SyscallId::Read) => {
             if handle_kind(arg0) == HANDLE_KIND_PIPE_R {
                 let slot = handle_slot(arg0);
@@ -3844,7 +4565,7 @@ extern "C" fn syscall_dispatch(
         Some(syscall::SyscallId::DeviceRead) => device_read(arg0, arg1, arg2),
         Some(syscall::SyscallId::DeviceWrite) => device_write(arg0, arg1, arg2),
         Some(syscall::SyscallId::GetSystemInfo) => get_system_info(arg0, arg1, arg2),
-        Some(syscall::SyscallId::Yield) => syscall::SyscallResult { value: 0, error: 0 },
+        Some(syscall::SyscallId::Yield) => syscall_sched_yield(),
         Some(syscall::SyscallId::GetTid) => syscall::SyscallResult { value: 1, error: 0 },
         Some(syscall::SyscallId::GetPpid) => syscall::SyscallResult { value: 0, error: 0 },
         Some(syscall::SyscallId::GetUid) => syscall::SyscallResult { value: 0, error: 0 },
@@ -5933,12 +6654,8 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
     };
     let path = &path_buf[..n];
 
-    if CURRENT_PID.load(Ordering::Relaxed) != 0 {
-        return syscall_error(syscall::ENOTSUP);
-    }
-
-    let entry = match load_user_elf(path) {
-        Ok(e) => e,
+    let (entry, address_space_root) = match load_user_elf(path) {
+        Ok(program) => program,
         Err(err) => return syscall_error(err),
     };
 
@@ -5952,6 +6669,9 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
     }
     let Some(slot) = slot else {
         unlock_kernel();
+        if !unsafe { free_user_address_space(address_space_root) } {
+            halt();
+        }
         return syscall_error(syscall::EAGAIN);
     };
     let pid = NEXT_SPAWN_PID.fetch_add(1, Ordering::Relaxed);
@@ -5959,10 +6679,20 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
         SPAWNED[slot] = SpawnedProc {
             used: true,
             pid,
+            parent_pid: CURRENT_PID.load(Ordering::Acquire).max(1),
             exited: false,
             exit_code: 0,
             ready: true,
+            blocked: false,
             entry,
+            address_space_root,
+            heap_next: USER_STACK_TOP,
+            context: UserContext::empty(),
+            context_valid: false,
+            scheduler_test: false,
+            wait_pid: 0,
+            wait_status_ptr: 0,
+            waited: false,
         };
         let name_len = core::cmp::min(n, MAX_PROC_NAME);
         PROC_NAMES[slot][..name_len].copy_from_slice(&path_buf[..name_len]);
@@ -5980,34 +6710,71 @@ fn sys_wait(pid: u64, status_ptr: u64, _options: u64) -> syscall::SyscallResult 
     if status_ptr != 0 && !valid_user_range_access(status_ptr, core::mem::size_of::<u64>(), true) {
         return syscall_error(syscall::EFAULT);
     }
+    let parent_pid = CURRENT_PID.load(Ordering::Acquire);
+    if parent_pid == 0 {
+        return syscall_error(syscall::ECHILD);
+    }
+
     lock_kernel();
-    let mut found = None;
+    let mut matching_child = false;
+    let mut exited_child = None;
     for i in 0..MAX_SPAWNED {
         let p = unsafe { SPAWNED[i] };
-        if p.used && p.exited && (pid == 0 || pid == p.pid) {
-            found = Some(i);
+        if p.used && p.parent_pid == parent_pid && (pid == 0 || pid == p.pid) {
+            matching_child = true;
+            if p.exited {
+                exited_child = Some(i);
+                break;
+            }
+        }
+    }
+    if let Some(idx) = exited_child {
+        let process = unsafe { SPAWNED[idx] };
+        unsafe {
+            SPAWNED[idx] = SpawnedProc::empty();
+            PROC_NAMES[idx] = [0; MAX_PROC_NAME];
+            PROC_NAME_LENS[idx] = 0;
+        }
+        unlock_kernel();
+        if status_ptr != 0 {
+            unsafe {
+                core::ptr::write_unaligned(status_ptr as *mut u64, process.exit_code);
+            }
+        }
+        return syscall::SyscallResult::success(process.pid);
+    }
+
+    if !matching_child {
+        unlock_kernel();
+        return syscall_error(syscall::ECHILD);
+    }
+
+    let mut parent_slot = None;
+    for i in 0..MAX_SPAWNED {
+        if unsafe { SPAWNED[i].used && SPAWNED[i].pid == parent_pid } {
+            parent_slot = Some(i);
             break;
         }
     }
-    let Some(idx) = found else {
+    let Some(parent_slot) = parent_slot else {
         unlock_kernel();
-        return syscall_error(syscall::ECHILD);
+        return syscall_error(syscall::ESRCH);
     };
-    let proc_pid = unsafe { SPAWNED[idx].pid };
-    let exit_code = unsafe { SPAWNED[idx].exit_code };
+    let mut context = unsafe {
+        core::ptr::addr_of!(SYSCALL_USER_CONTEXT).read_volatile()
+    };
+    context.set_syscall_result(0, 0);
     unsafe {
-        SPAWNED[idx] = SpawnedProc::empty();
+        let parent = &mut *core::ptr::addr_of_mut!(SPAWNED[parent_slot]);
+        parent.context = context;
+        parent.context_valid = true;
+        parent.blocked = true;
+        parent.ready = false;
+        parent.wait_pid = pid;
+        parent.wait_status_ptr = status_ptr;
     }
     unlock_kernel();
-    if status_ptr != 0 {
-        unsafe {
-            core::ptr::write_unaligned(status_ptr as *mut u64, exit_code);
-        }
-    }
-    syscall::SyscallResult {
-        value: proc_pid,
-        error: 0,
-    }
+    unsafe { kernel_exit_resume() }
 }
 
 fn sys_device_control(
