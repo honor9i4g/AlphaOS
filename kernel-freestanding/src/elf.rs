@@ -42,6 +42,18 @@ pub const fn user_page_flags(segment_flags: u32, nx_supported: bool) -> u64 {
     flags
 }
 
+pub const fn user_mapping_allows_access(entries: [u64; 4], write: bool) -> bool {
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        if entry & 0x5 != 0x5 || (write && entry & 0x2 == 0) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 pub fn validate_image(
     image: &[u8],
     user_start: u64,

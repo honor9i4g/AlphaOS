@@ -1289,10 +1289,10 @@ type SyscallResult = syscall::SyscallResult;
 
 fn syscall_errno(e: u64) -> u64 { e }
 
-fn validate_user_buffer(ptr: u64, len: u64, _write: bool) -> Result<(), u64> {
+fn validate_user_buffer(ptr: u64, len: u64, write: bool) -> Result<(), u64> {
     let Ok(l) = usize::try_from(len) else { return Err(syscall::EINVAL); };
     if l == 0 { return Ok(()); }
-    if !valid_user_range(ptr, l) { return Err(syscall::EFAULT); }
+    if !valid_user_range_access(ptr, l, write) { return Err(syscall::EFAULT); }
     Ok(())
 }
 
@@ -3609,7 +3609,7 @@ extern "C" fn syscall_dispatch(
                 let Ok(len) = usize::try_from(arg2) else {
                     return syscall_error(syscall::EINVAL);
                 };
-                if len != 0 && !valid_user_range(arg1, len) {
+                if len != 0 && !valid_user_range_access(arg1, len, true) {
                     return syscall_error(syscall::EFAULT);
                 }
                 pipe_read(slot, arg1, len)
@@ -3623,7 +3623,7 @@ extern "C" fn syscall_dispatch(
                 let Ok(len) = usize::try_from(arg2) else {
                     return syscall_error(syscall::EINVAL);
                 };
-                if len != 0 && !valid_user_range(arg1, len) {
+                if len != 0 && !valid_user_range_access(arg1, len, false) {
                     return syscall_error(syscall::EFAULT);
                 }
                 pipe_write(slot, arg1, len)
@@ -4138,7 +4138,7 @@ fn device_list(entries: u64, capacity: u64) -> syscall::SyscallResult {
     let Some(bytes) = count.checked_mul(core::mem::size_of::<syscall::DeviceInfo>()) else {
         return syscall_error(syscall::EFAULT);
     };
-    if bytes != 0 && !valid_user_range(entries, bytes) {
+    if bytes != 0 && !valid_user_range_access(entries, bytes, true) {
         return syscall_error(syscall::EFAULT);
     }
 
@@ -4434,7 +4434,7 @@ fn truncate_handle(handle: u64, _length: u64) -> syscall::SyscallResult {
 
 fn fstat_handle(handle: u64, out_ptr: u64) -> syscall::SyscallResult {
     let size = core::mem::size_of::<syscall::FileStat>();
-    if !valid_user_range(out_ptr, size) {
+    if !valid_user_range_access(out_ptr, size, true) {
         return syscall_error(syscall::EFAULT);
     }
     let kind = handle_kind(handle);
@@ -4486,7 +4486,7 @@ fn fstat_handle(handle: u64, out_ptr: u64) -> syscall::SyscallResult {
 
 fn pipe_create(out_ptr: u64) -> syscall::SyscallResult {
     let size = core::mem::size_of::<[u64; 2]>();
-    if !valid_user_range(out_ptr, size) {
+    if !valid_user_range_access(out_ptr, size, true) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -4612,7 +4612,7 @@ fn pipe_write(slot: usize, buffer: u64, length: usize) -> syscall::SyscallResult
 
 fn channel_pair_create(out_ptr: u64, _flags: u64) -> syscall::SyscallResult {
     let size = core::mem::size_of::<[u64; 2]>();
-    if !valid_user_range(out_ptr, size) {
+    if !valid_user_range_access(out_ptr, size, true) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -4662,7 +4662,7 @@ fn channel_send(handle: u64, buffer: u64, length: u64, _flags: u64) -> syscall::
     if len == 0 {
         return syscall::SyscallResult { value: 0, error: 0 };
     }
-    if !valid_user_range(buffer, len) {
+    if !valid_user_range_access(buffer, len, false) {
         return syscall_error(syscall::EFAULT);
     }
     let slot = handle_slot(handle);
@@ -4707,7 +4707,7 @@ fn channel_receive(handle: u64, buffer: u64, length: u64, _flags: u64) -> syscal
     if len == 0 {
         return syscall::SyscallResult { value: 0, error: 0 };
     }
-    if !valid_user_range(buffer, len) {
+    if !valid_user_range_access(buffer, len, true) {
         return syscall_error(syscall::EFAULT);
     }
     let slot = handle_slot(handle);
@@ -5091,7 +5091,7 @@ fn sys_file_read(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResul
     if len == 0 {
         return syscall::SyscallResult { value: 0, error: 0 };
     }
-    if !valid_user_range(buffer, len) {
+    if !valid_user_range_access(buffer, len, true) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -5130,7 +5130,7 @@ fn sys_file_write(handle: u64, buffer: u64, length: u64) -> syscall::SyscallResu
     if len == 0 {
         return syscall::SyscallResult { value: 0, error: 0 };
     }
-    if !valid_user_range(buffer, len) {
+    if !valid_user_range_access(buffer, len, false) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -5206,7 +5206,7 @@ fn sys_stat(path_ptr: u64, path_len: u64, stat_ptr: u64) -> syscall::SyscallResu
     let Some(n) = read_user_path(path_ptr, path_len, &mut path_buf) else {
         return syscall_error(syscall::EFAULT);
     };
-    if !valid_user_range(stat_ptr, core::mem::size_of::<syscall::FileStat>()) {
+    if !valid_user_range_access(stat_ptr, core::mem::size_of::<syscall::FileStat>(), true) {
         return syscall_error(syscall::EFAULT);
     }
     let Some(idx) = fs_find(&path_buf[..n]) else {
@@ -5232,7 +5232,7 @@ fn sys_readdir(handle: u64, entry_ptr: u64) -> syscall::SyscallResult {
     let Some(slot) = file_handle_slot(handle) else {
         return syscall_error(syscall::EBADF);
     };
-    if !valid_user_range(entry_ptr, core::mem::size_of::<syscall::DirEntry>()) {
+    if !valid_user_range_access(entry_ptr, core::mem::size_of::<syscall::DirEntry>(), true) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -5419,7 +5419,7 @@ fn sys_clock_gettime(clock_id: u64, timespec_ptr: u64) -> syscall::SyscallResult
     if clock_id != syscall::CLOCK_REALTIME && clock_id != syscall::CLOCK_MONOTONIC {
         return syscall_error(syscall::EINVAL);
     }
-    if !valid_user_range(timespec_ptr, core::mem::size_of::<syscall::TimeSpec>()) {
+    if !valid_user_range_access(timespec_ptr, core::mem::size_of::<syscall::TimeSpec>(), true) {
         return syscall_error(syscall::EFAULT);
     }
     let tsc = read_tsc();
@@ -5507,7 +5507,7 @@ fn sys_spawn(path_ptr: u64, path_len: u64, _argv_ptr: u64, _flags: u64) -> sysca
 }
 
 fn sys_wait(pid: u64, status_ptr: u64, _options: u64) -> syscall::SyscallResult {
-    if status_ptr != 0 && !valid_user_range(status_ptr, core::mem::size_of::<u64>()) {
+    if status_ptr != 0 && !valid_user_range_access(status_ptr, core::mem::size_of::<u64>(), true) {
         return syscall_error(syscall::EFAULT);
     }
     lock_kernel();
@@ -5554,7 +5554,7 @@ fn sys_device_control(
     // Minimal device control: request 0 returns device id in output u32/u64.
     match request {
         0 => {
-            if output_len < 4 || !valid_user_range(output_ptr, 4) {
+            if output_len < 4 || !valid_user_range_access(output_ptr, 4, true) {
                 return syscall_error(syscall::EINVAL);
             }
             unsafe {
@@ -5650,7 +5650,7 @@ fn get_system_info(kind: u64, buffer: u64, length: u64) -> syscall::SyscallResul
             error: syscall::EINVAL,
         };
     }
-    if !valid_user_range(buffer, size) {
+    if !valid_user_range_access(buffer, size, true) {
         return syscall::SyscallResult {
             value: u64::MAX,
             error: syscall::EFAULT,
@@ -5683,7 +5683,7 @@ fn read_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
             error: syscall::EINVAL,
         };
     }
-    if !valid_user_range(buffer, 1) {
+    if !valid_user_range_access(buffer, 1, true) {
         return syscall::SyscallResult {
             value: u64::MAX,
             error: syscall::EFAULT,
@@ -5723,7 +5723,7 @@ fn read_input_event(buffer: u64, length: u64) -> syscall::SyscallResult {
     if length < event_size {
         return syscall_error(syscall::EINVAL);
     }
-    if !valid_user_range(buffer, event_size) {
+    if !valid_user_range_access(buffer, event_size, true) {
         return syscall_error(syscall::EFAULT);
     }
     if input::foreground_target() != Some(USER_INPUT_TARGET) {
@@ -5761,7 +5761,7 @@ fn write_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
             error: syscall::EFAULT,
         };
     };
-    if !valid_user_range(buffer, length) {
+    if !valid_user_range_access(buffer, length, false) {
         return syscall::SyscallResult {
             value: u64::MAX,
             error: syscall::EFAULT,
@@ -5795,6 +5795,10 @@ fn write_console(fd: u64, buffer: u64, length: u64) -> syscall::SyscallResult {
 }
 
 fn valid_user_range(address: u64, length: usize) -> bool {
+    valid_user_range_access(address, length, false)
+}
+
+fn valid_user_range_access(address: u64, length: usize, write: bool) -> bool {
     let Ok(length) = u64::try_from(length) else {
         return false;
     };
@@ -5813,7 +5817,7 @@ fn valid_user_range(address: u64, length: usize) -> bool {
     let mut page_address = address & !(PAGE_SIZE - 1);
     let last_page = (end - 1) & !(PAGE_SIZE - 1);
     loop {
-        if !user_page_mapped(page_address) {
+        if !user_page_allows_access(page_address, write) {
             return false;
         }
         if page_address == last_page {
@@ -5826,7 +5830,7 @@ fn valid_user_range(address: u64, length: usize) -> bool {
     }
 }
 
-fn user_page_mapped(address: u64) -> bool {
+fn user_page_allows_access(address: u64, write: bool) -> bool {
     let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
     let Some(root_address) = page_table_root().checked_add(hhdm) else {
         return false;
@@ -5839,13 +5843,18 @@ fn user_page_mapped(address: u64) -> bool {
         ((address >> 12) & 0x1FF) as usize,
     ];
     let mut table = pml4;
+    let mut path = [0u64; 4];
     for (level, index) in indexes.into_iter().enumerate() {
         let entry = unsafe { table.add(index).read_volatile() };
-        if entry & 0x5 != 0x5 || (level > 0 && entry & (1 << 7) != 0) {
+        path[level] = entry;
+        if entry & 0x5 != 0x5 {
+            return false;
+        }
+        if level > 0 && entry & (1 << 7) != 0 {
             return false;
         }
         if level == indexes.len() - 1 {
-            return true;
+            return elf::user_mapping_allows_access(path, write);
         }
         let physical = entry & 0x000F_FFFF_FFFF_F000;
         let Some(virtual_address) = physical.checked_add(hhdm) else {

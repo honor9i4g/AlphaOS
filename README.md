@@ -27,10 +27,9 @@ without losing the existing QEMU-testable shell.
 The freestanding kernel defines **500** syscall IDs (`0-499`) in
 [kernel-freestanding/syscall-abi](kernel-freestanding/syscall-abi) as the
 planned kernel/application interface (ABI version 1.4). IDs are sequential and
-stable; each ID has name/category/argument metadata. The kernel dispatches every
-ID through a real handler (no reserved ENOSYS ABI slots), but many handlers are
-pragmatic freestanding implementations and some unsupported features return
-defined errors such as `ENOTSUP`.
+stable; each ID has name/category/argument metadata. This is the ABI table size,
+not a claim that 500 complete OS services are implemented: many handlers are
+minimal stubs or return defined errors such as `ENOTSUP`.
 
 Core areas covered by the ABI include process/control, file/FD, memory,
 time/system info, device/input/framebuffer, IPC/sync, networking-style handles,
@@ -51,8 +50,9 @@ The freestanding kernel prototype now includes initial M1 execution-path work:
   and writable-executable segment policy before mapping `PT_LOAD` segments from
   RAMFS. Segment write/execute permissions are reflected in page-table entries;
   non-executable pages use NX when supported. A four-page user stack is mapped,
-  and syscall buffer checks require present user pages. Invalid images return
-  `ENOEXEC`; out-of-range segments return `EFAULT`.
+  and syscall buffer checks validate present user mappings and write permission
+  for kernel-to-user buffers. Invalid images return `ENOEXEC`; out-of-range
+  segments return `EFAULT`.
 - **Physical frames**: builds a free-page list from Limine-reported usable
   memory, zeroes frames on allocation, returns an unused frame if an ELF page
   cannot be mapped, and reports total/allocated/available frame bytes. General

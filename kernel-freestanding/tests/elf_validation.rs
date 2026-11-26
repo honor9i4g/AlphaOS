@@ -54,6 +54,23 @@ fn derives_user_page_permissions_from_segment_flags() {
 }
 
 #[test]
+fn user_mapping_access_requires_present_user_and_write_permissions() {
+    let writable_user_path = [0x7; 4];
+    assert!(elf::user_mapping_allows_access(writable_user_path, false));
+    assert!(elf::user_mapping_allows_access(writable_user_path, true));
+
+    let readonly_user_page = [0x7, 0x7, 0x7, 0x5];
+    assert!(elf::user_mapping_allows_access(readonly_user_page, false));
+    assert!(!elf::user_mapping_allows_access(readonly_user_page, true));
+
+    let supervisor_page = [0x7, 0x7, 0x7, 0x3];
+    assert!(!elf::user_mapping_allows_access(supervisor_page, false));
+
+    let absent_page = [0x7, 0x7, 0x7, 0x4];
+    assert!(!elf::user_mapping_allows_access(absent_page, false));
+}
+
+#[test]
 fn rejects_truncated_segment_file_data() {
     let mut image = valid_image();
     image.truncate(0x1000);
