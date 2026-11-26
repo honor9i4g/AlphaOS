@@ -18,9 +18,9 @@ without losing the existing QEMU-testable shell.
   persistent filesystem/storage drivers, richer device/input/graphics drivers,
   windowing/compositor/UI toolkit, IPC/services, packaging, and security
   hardening.
-- **Runtime status**: the freestanding build and host-side tests pass, but
-  QEMU has not yet confirmed execution of the Limine kernel entry point. Do
-  not treat the prototype as a boot-verified or stable OS.
+- **Runtime status**: M0 is boot-verified in QEMU: Limine loads the static
+  freestanding ELF and the kernel reaches its framebuffer console. This does
+  not yet prove an interactive userspace, process isolation, or a stable OS.
 
 ## Freestanding syscall ABI
 
@@ -113,7 +113,9 @@ cargo build --release --target x86_64-unknown-uefi -p alphaos-bootloader
 Build the freestanding kernel prototype:
 
 ```powershell
-cargo build --release --manifest-path .\kernel-freestanding\Cargo.toml --target x86_64-unknown-none
+Push-Location .\kernel-freestanding
+cargo build --release --target x86_64-unknown-none
+Pop-Location
 ```
 
 The freestanding build produces:

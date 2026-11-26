@@ -33,6 +33,11 @@ jobs:
         working-directory: kernel-freestanding
         run: cargo build --target x86_64-unknown-none
 
+      - name: Verify Limine kernel ELF type
+        working-directory: kernel-freestanding
+        run: |
+          python -c "import struct; f = open('target/x86_64-unknown-none/debug/alphaos-kernel-freestanding', 'rb'); f.seek(16); assert struct.unpack('<H', f.read(2))[0] == 2, 'expected ET_EXEC for Limine'; print('kernel ELF is ET_EXEC')"
+
       - name: Check edited freestanding Rust formatting
         working-directory: kernel-freestanding
         run: rustfmt --edition=2024 --check src/elf.rs tests/elf_validation.rs
