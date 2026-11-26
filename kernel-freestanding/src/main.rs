@@ -4,6 +4,7 @@
 #[path = "../../kernel/src/font.rs"]
 #[allow(dead_code, unsafe_op_in_unsafe_fn)]
 mod font;
+mod elf;
 mod input;
 mod interrupts;
 mod keyboard;
@@ -1030,43 +1031,6 @@ unsafe fn write_msr(register: u32, value: u64) {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Elf64Ehdr {
-    e_ident: [u8; 16],
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-    e_shentsize: u16,
-    e_shnum: u16,
-    e_shstrndx: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Elf64Phdr {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-}
-
-const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
-const ET_EXEC: u16 = 2;
-const EM_X86_64: u16 = 62;
-const PT_LOAD: u32 = 1;
-
 fn page_table_root() -> u64 {
     unsafe {
         let value: u64;
@@ -1088,6 +1052,7 @@ unsafe fn map_user_page(va: u64, phys: u64) -> bool {
     unsafe fn ensure_table(entry_ptr: *mut u64, hhdm: u64) -> Option<*mut u64> {
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & 1 != 0 {
+            unsafe { entry_ptr.write_volatile(entry | 0x7); }
             let phys = entry & 0x000F_FFFF_FFFF_F000;
             return Some((phys + hhdm) as *mut u64);
         }
@@ -1099,6 +1064,9 @@ unsafe fn map_user_page(va: u64, phys: u64) -> bool {
     let Some(pdpt) = (unsafe { ensure_table(pml4.add(idx4), hhdm) }) else { return false; };
     let Some(pd) = (unsafe { ensure_table(pdpt.add(idx3), hhdm) }) else { return false; };
     let Some(pt) = (unsafe { ensure_table(pd.add(idx2), hhdm) }) else { return false; };
+    if unsafe { pt.add(idx1).read_volatile() } & 1 != 0 {
+        return false;
+    }
     unsafe { pt.add(idx1).write_volatile((phys & 0x000F_FFFF_FFFF_F000) | 0x7); }
     unsafe { asm!("invlpg [{}]", in(reg) va as usize, options(nostack, preserves_flags)); }
     true
@@ -1108,48 +1076,70 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
     init_fs();
     let Some(idx) = fs_find(path) else { return Err(syscall::ENOENT); };
     let (size, data_ptr) = unsafe { (FS_FILES[idx].size, FS_FILES[idx].data.as_ptr()) };
-    if size < core::mem::size_of::<Elf64Ehdr>() { return Err(syscall::ENOEXEC); }
-    let ehdr = unsafe { core::ptr::read_unaligned(data_ptr as *const Elf64Ehdr) };
-    if ehdr.e_ident[0..4] != ELF_MAGIC || ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
-        return Err(syscall::ENOEXEC);
-    }
-    if ehdr.e_type != ET_EXEC || ehdr.e_machine != EM_X86_64 { return Err(syscall::ENOEXEC); }
-    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() { return Err(syscall::ENOEXEC); }
-    let phoff = ehdr.e_phoff as usize;
-    let phnum = ehdr.e_phnum as usize;
-    let phsz = core::mem::size_of::<Elf64Phdr>();
-    if phoff.checked_add(phnum.saturating_mul(phsz)).unwrap_or(usize::MAX) > size { return Err(syscall::ENOEXEC); }
+    let image = unsafe { core::slice::from_raw_parts(data_ptr, size) };
+    let plan = elf::validate_image(image, USER_CODE_BASE, USER_REGION_END).map_err(|error| {
+        match error {
+            elf::ValidationError::InvalidImage => syscall::ENOEXEC,
+            elf::ValidationError::OutOfRange => syscall::EFAULT,
+        }
+    })?;
 
-    for i in 0..phnum {
-        let ph = unsafe { core::ptr::read_unaligned(data_ptr.add(phoff + i * phsz) as *const Elf64Phdr) };
-        if ph.p_type != PT_LOAD { continue; }
-        if ph.p_memsz == 0 { continue; }
-        if ph.p_filesz > ph.p_memsz { return Err(syscall::ENOEXEC); }
-        let seg_start = ph.p_vaddr & !0xFFF;
-        let seg_end = match ph.p_vaddr.checked_add(ph.p_memsz) { Some(v) => (v + 0xFFF) & !0xFFF, None => return Err(syscall::ENOEXEC) };
-        if seg_start < USER_CODE_BASE || seg_end > USER_REGION_END { return Err(syscall::EFAULT); }
-        let mut va = seg_start;
-        while va < seg_end {
-            let Some((phys, virt)) = (unsafe { allocate_page() }) else { return Err(syscall::ENOMEM); };
-            let _ = virt;
-            if !unsafe { map_user_page(va, phys) } { return Err(syscall::ENOMEM); }
+    for index in 0..plan.program_header_count {
+        let segment = elf::program_header(image, plan, index).map_err(|_| syscall::ENOEXEC)?;
+        if segment.kind != 1 || segment.memory_size == 0 {
+            continue;
+        }
+
+        let memory_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(syscall::ENOEXEC)?;
+        let page_start = segment.virtual_address & !(PAGE_SIZE - 1);
+        let page_end = memory_end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(syscall::ENOEXEC)?
+            & !(PAGE_SIZE - 1);
+        let mut page_address = page_start;
+
+        while page_address < page_end {
+            let Some((physical, _)) = (unsafe { allocate_page() }) else {
+                return Err(syscall::ENOMEM);
+            };
+            if !unsafe { map_user_page(page_address, physical) } {
+                return Err(syscall::ENOMEM);
+            }
+
             let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
-            let dst = (phys + hhdm) as *mut u8;
-            unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE as usize); }
-            let page_off = va.saturating_sub(ph.p_vaddr);
-            for b in 0..PAGE_SIZE as usize {
-                let file_off = page_off as usize + b;
-                if file_off < ph.p_filesz as usize {
-                    let src_off = ph.p_offset as usize + file_off;
-                    if src_off < size {
-                        unsafe { core::ptr::write(dst.add(b), *data_ptr.add(src_off)); }
-                    }
+            let destination = (physical + hhdm) as *mut u8;
+            let copy_start = page_address.max(segment.virtual_address);
+            let copy_end = (page_address + PAGE_SIZE).min(
+                segment
+                    .virtual_address
+                    .checked_add(segment.file_size)
+                    .ok_or(syscall::ENOEXEC)?,
+            );
+            if copy_start < copy_end {
+                let source_offset = segment
+                    .offset
+                    .checked_add(copy_start - segment.virtual_address)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or(syscall::ENOEXEC)?;
+                let destination_offset = usize::try_from(copy_start - page_address)
+                    .map_err(|_| syscall::ENOEXEC)?;
+                let copy_length = usize::try_from(copy_end - copy_start)
+                    .map_err(|_| syscall::ENOEXEC)?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        image.as_ptr().add(source_offset),
+                        destination.add(destination_offset),
+                        copy_length,
+                    );
                 }
             }
-            va += PAGE_SIZE;
+            page_address += PAGE_SIZE;
         }
     }
-    Ok(ehdr.e_entry)
+    Ok(plan.entry)
 }
 
 fn try_exec_user_program(path: &[u8]) -> Result<u64, u64> {
