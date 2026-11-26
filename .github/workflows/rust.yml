@@ -40,7 +40,7 @@ jobs:
 
       - name: Check edited freestanding Rust formatting
         working-directory: kernel-freestanding
-        run: rustfmt --edition=2024 --check src/elf.rs tests/elf_validation.rs
+        run: rustfmt --edition=2024 --check src/elf.rs src/interrupts.rs src/keyboard.rs tests/elf_validation.rs
 
       - name: Test ELF loader validation
         run: |

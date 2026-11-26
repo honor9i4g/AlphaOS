@@ -713,7 +713,7 @@ extern "C" fn kmain() -> ! {
         RNG_STATE ^= read_tsc();
     }
 
-    interrupts::initialize();
+    interrupts::initialize(kernel_exception_report);
     if !ps2::initialize() {
         draw_text(
             address,
@@ -739,7 +739,19 @@ extern "C" fn kmain() -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_run_loop() {
+    let mut timer_status_drawn = false;
+    let mut keyboard_status_drawn = false;
     loop {
+        let timer_irqs = interrupts::timer_irq_count();
+        if !timer_status_drawn && timer_irqs > 0 {
+            draw_irq_status("PIT timer IRQ0: active", 40);
+            timer_status_drawn = true;
+        }
+        let keyboard_irqs = interrupts::keyboard_irq_count();
+        if !keyboard_status_drawn && keyboard_irqs > 0 {
+            draw_irq_status("PS/2 keyboard IRQ1: active", 56);
+            keyboard_status_drawn = true;
+        }
         let mut found: Option<(usize, u64, u64)> = None;
         lock_kernel();
         unsafe {
@@ -782,7 +794,198 @@ extern "C" fn kernel_run_loop() {
             }
             unlock_kernel();
         } else {
-            unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)); }
+            interrupts::wait_for_interrupt();
+        }
+    }
+}
+
+fn draw_irq_status(text: &str, y: usize) {
+    let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
+    if console.is_null() {
+        return;
+    }
+    let console = unsafe { &*console };
+    draw_text(
+        console.address,
+        console.width,
+        console.height,
+        console.pitch,
+        console.pixel_format,
+        Console::LEFT,
+        y,
+        text,
+        0x40,
+        0xFF,
+        0x80,
+    );
+}
+
+extern "C" fn kernel_exception_report(
+    vector: u64,
+    error: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    cr2: u64,
+) -> ! {
+    let console = unsafe { core::ptr::addr_of!(SYSCALL_CONSOLE).read_volatile() };
+    if !console.is_null() {
+        let console = unsafe { &*console };
+        clear_screen(
+            console.address,
+            console.width,
+            console.height,
+            console.pitch,
+            console.pixel_format,
+        );
+        draw_text(
+            console.address,
+            console.width,
+            console.height,
+            console.pitch,
+            console.pixel_format,
+            Console::LEFT,
+            24,
+            "FATAL CPU EXCEPTION - SYSTEM HALTED",
+            0xFF,
+            0x40,
+            0x40,
+        );
+        draw_text(
+            console.address,
+            console.width,
+            console.height,
+            console.pitch,
+            console.pixel_format,
+            Console::LEFT,
+            40,
+            exception_name(vector),
+            0xFF,
+            0xA0,
+            0x40,
+        );
+        draw_exception_value(console, "VECTOR", vector, 56);
+        draw_exception_value(console, "ERROR", error, 72);
+        draw_exception_value(console, "RIP", rip, 88);
+        draw_exception_value(console, "CS", cs, 104);
+        draw_exception_value(console, "RFLAGS", rflags, 120);
+        draw_exception_value(console, "CR2", cr2, 136);
+    }
+    debug_exception_report(vector, error, rip, cr2);
+    halt()
+}
+
+fn draw_exception_value(console: &Console, label: &str, value: u64, y: usize) {
+    draw_text(
+        console.address,
+        console.width,
+        console.height,
+        console.pitch,
+        console.pixel_format,
+        Console::LEFT,
+        y,
+        label,
+        0xFF,
+        0xFF,
+        0xFF,
+    );
+    let mut hex = [b'0'; 18];
+    hex[1] = b'x';
+    for (index, digit) in hex[2..].iter_mut().enumerate() {
+        let shift = (15 - index) * 4;
+        let nibble = ((value >> shift) & 0xF) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+    if let Ok(hex) = core::str::from_utf8(&hex) {
+        draw_text(
+            console.address,
+            console.width,
+            console.height,
+            console.pitch,
+            console.pixel_format,
+            Console::LEFT + 10 * 8,
+            y,
+            hex,
+            0xFF,
+            0xFF,
+            0xFF,
+        );
+    }
+}
+
+fn exception_name(vector: u64) -> &'static str {
+    match vector {
+        0 => "Divide error",
+        1 => "Debug exception",
+        2 => "Non-maskable interrupt",
+        3 => "Breakpoint",
+        4 => "Overflow",
+        5 => "Bound range exceeded",
+        6 => "Invalid opcode",
+        7 => "Device not available",
+        8 => "Double fault",
+        10 => "Invalid TSS",
+        11 => "Segment not present",
+        12 => "Stack-segment fault",
+        13 => "General protection fault",
+        14 => "Page fault",
+        16 => "x87 floating-point exception",
+        17 => "Alignment check",
+        18 => "Machine check",
+        19 => "SIMD floating-point exception",
+        20 => "Virtualization exception",
+        21 => "Control-protection exception",
+        29 => "VMM communication exception",
+        30 => "Security exception",
+        255 => "Unexpected interrupt",
+        _ => "Reserved CPU exception",
+    }
+}
+
+fn debug_exception_report(vector: u64, error: u64, rip: u64, cr2: u64) {
+    debug_write("ALPHAOS FATAL EXCEPTION vector=");
+    debug_write_hex(vector);
+    debug_write(" error=");
+    debug_write_hex(error);
+    debug_write(" rip=");
+    debug_write_hex(rip);
+    debug_write(" cr2=");
+    debug_write_hex(cr2);
+    debug_write("\n");
+}
+
+fn debug_write(text: &str) {
+    for byte in text.bytes() {
+        unsafe {
+            asm!(
+                "out dx, al",
+                in("dx") 0xE9u16,
+                in("al") byte,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+fn debug_write_hex(value: u64) {
+    for shift in (0..16).rev() {
+        let nibble = ((value >> (shift * 4)) & 0xF) as u8;
+        let byte = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+        unsafe {
+            asm!(
+                "out dx, al",
+                in("dx") 0xE9u16,
+                in("al") byte,
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }

@@ -115,6 +115,7 @@ pub fn reset_decoder() {
 
 #[unsafe(no_mangle)]
 extern "C" fn keyboard_irq_handler() {
+    crate::interrupts::record_keyboard_irq();
     unsafe {
         let status = crate::ps2::read_status();
         if status & 1 != 0 {
@@ -127,7 +128,7 @@ extern "C" fn keyboard_irq_handler() {
             }
         }
     }
-    crate::interrupts::end_of_interrupt();
+    crate::interrupts::end_of_interrupt(1);
 }
 
 pub fn event_to_ascii(event: &InputEvent) -> Option<u8> {

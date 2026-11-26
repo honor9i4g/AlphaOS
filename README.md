@@ -75,6 +75,18 @@ The freestanding kernel prototype now includes initial M1 execution-path work:
 
 No tiny userspace demo apps are included by default.
 
+## M2 exception and interrupt foundations
+
+The freestanding kernel installs vector-specific CPU exception stubs with
+correct error-code stack handling. Fatal exceptions report the vector, error
+code, instruction pointer, code segment, flags, and CR2 to the framebuffer and
+QEMU debug port, then halt. The double-fault gate uses a dedicated IST stack.
+The remapped PIC enables a 100 Hz PIT timer and the initialized PS/2 keyboard;
+IRQ counters confirm both interrupt paths, and the kernel idle loop waits with
+interrupts enabled. QEMU verification reached the kernel console, observed
+timer and keyboard IRQ activity, and injected an NMI to verify fatal exception
+reporting.
+
 Run the focused ELF validation tests from the repository root:
 
 ```powershell
