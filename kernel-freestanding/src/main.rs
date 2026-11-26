@@ -43,9 +43,10 @@ struct Console {
 const PAGE_SIZE: u64 = 4096;
 const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
 const USER_DATA_BASE: u64 = USER_CODE_BASE + PAGE_SIZE;
-const USER_STACK_BASE: u64 = USER_CODE_BASE + 2 * PAGE_SIZE;
-const USER_REGION_END: u64 = USER_CODE_BASE + 3 * PAGE_SIZE;
-const USER_STACK_TOP: u64 = USER_REGION_END;
+const USER_REGION_END: u64 = USER_CODE_BASE + 0x0100_0000;
+const USER_STACK_BASE: u64 = USER_REGION_END;
+const USER_STACK_TOP: u64 = USER_STACK_BASE + 4 * PAGE_SIZE;
+const USER_ADDRESS_LIMIT: u64 = 0x0000_8000_0000_0000;
 const USER_INPUT_TARGET: u64 = 1;
 
 #[repr(C, align(16))]
@@ -71,12 +72,14 @@ static mut SYSCALL_SAVED_RAX: u64 = 0;
 static mut KERNEL_RESUME_RSP: u64 = 0;
 static mut SYSCALL_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut HHDM_OFFSET: u64 = 0;
-static mut ALLOCATOR_START: u64 = 0;
-static mut ALLOCATOR_NEXT: u64 = 0;
-static mut ALLOCATOR_END: u64 = 0;
+static PAGE_FREE_HEAD: AtomicU64 = AtomicU64::new(0);
+static PAGE_TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PAGE_FREE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PAGE_ALLOCATOR_LOCK: AtomicU8 = AtomicU8::new(0);
+static NX_ENABLED: AtomicU8 = AtomicU8::new(0);
 static OPENED_DEVICE_IDS: AtomicU32 = AtomicU32::new(0);
 static PROCESS_PRIORITY: AtomicI32 = AtomicI32::new(0);
-static USER_HEAP_NEXT: AtomicU64 = AtomicU64::new(USER_REGION_END);
+static USER_HEAP_NEXT: AtomicU64 = AtomicU64::new(USER_STACK_TOP);
 
 const HANDLE_KIND_PIPE_R: u32 = 0x10;
 const HANDLE_KIND_PIPE_W: u32 = 0x11;
@@ -640,6 +643,13 @@ extern "C" fn kmain() -> ! {
     if !initialize_page_allocator() {
         halt();
     }
+    if cpu_supports_nx() {
+        let efer = unsafe { read_msr(0xC000_0080) } | (1 << 11);
+        unsafe {
+            write_msr(0xC000_0080, efer);
+        }
+        NX_ENABLED.store(1, Ordering::Release);
+    }
 
     let Some(response) = FRAMEBUFFER_REQUEST.get_response() else {
         halt();
@@ -882,48 +892,137 @@ fn initialize_page_allocator() -> bool {
         return false;
     };
 
-    let Some(region) = memory_map
-        .entries()
-        .iter()
-        .find(|entry| entry.entry_type == EntryType::USABLE && entry.length >= 8 * 1024 * 1024)
-    else {
-        return false;
-    };
+    let hhdm_offset = hhdm.offset();
+    let mut free_head = 0;
+    let mut page_count = 0u64;
 
-    let Some(region_start) = region.base.checked_add(PAGE_SIZE - 1) else {
-        return false;
-    };
-    let region_start = (region_start & !(PAGE_SIZE - 1)).max(0x10_0000);
-    let Some(region_end) = region.base.checked_add(region.length) else {
-        return false;
-    };
-    if region_start >= region_end {
+    for region in memory_map.entries() {
+        if region.entry_type != EntryType::USABLE {
+            continue;
+        }
+        let Some(region_start) = region.base.checked_add(PAGE_SIZE - 1) else {
+            return false;
+        };
+        let Some(region_end) = region.base.checked_add(region.length) else {
+            return false;
+        };
+        let mut physical = (region_start & !(PAGE_SIZE - 1)).max(0x10_0000);
+        let region_end = region_end & !(PAGE_SIZE - 1);
+        while physical < region_end {
+            let Some(virtual_address) = physical.checked_add(hhdm_offset) else {
+                return false;
+            };
+            unsafe {
+                (virtual_address as *mut u64).write_volatile(free_head);
+            }
+            free_head = physical;
+            page_count = match page_count.checked_add(1) {
+                Some(count) => count,
+                None => return false,
+            };
+            let Some(next) = physical.checked_add(PAGE_SIZE) else {
+                return false;
+            };
+            physical = next;
+        }
+    }
+
+    if page_count < 2048 {
         return false;
     }
 
     unsafe {
-        core::ptr::addr_of_mut!(HHDM_OFFSET).write_volatile(hhdm.offset());
-        core::ptr::addr_of_mut!(ALLOCATOR_START).write_volatile(region_start);
-        core::ptr::addr_of_mut!(ALLOCATOR_NEXT).write_volatile(region_start);
-        core::ptr::addr_of_mut!(ALLOCATOR_END).write_volatile(region_end);
+        core::ptr::addr_of_mut!(HHDM_OFFSET).write_volatile(hhdm_offset);
     }
+    PAGE_FREE_HEAD.store(free_head, Ordering::Relaxed);
+    PAGE_TOTAL_COUNT.store(page_count, Ordering::Relaxed);
+    PAGE_FREE_COUNT.store(page_count, Ordering::Release);
     true
 }
 
 unsafe fn allocate_page() -> Option<(u64, *mut u8)> {
-    let next_ptr = core::ptr::addr_of_mut!(ALLOCATOR_NEXT);
-    let next = unsafe { next_ptr.read_volatile() };
-    let end = unsafe { core::ptr::addr_of!(ALLOCATOR_END).read_volatile() };
-    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
-    if next.checked_add(PAGE_SIZE)? > end {
+    while PAGE_ALLOCATOR_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        unsafe {
+            asm!("pause", options(nomem, nostack, preserves_flags));
+        }
+    }
+    let physical = PAGE_FREE_HEAD.load(Ordering::Relaxed);
+    let free_count = PAGE_FREE_COUNT.load(Ordering::Relaxed);
+    if physical == 0 || free_count == 0 || free_count > PAGE_TOTAL_COUNT.load(Ordering::Relaxed) {
+        PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
         return None;
     }
-    let virtual_address = next.checked_add(hhdm)?;
+    let hhdm_offset = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(virtual_address) = physical.checked_add(hhdm_offset) else {
+        PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+        return None;
+    };
+    let page = virtual_address as *mut u8;
+    let next = unsafe { page.cast::<u64>().read_volatile() };
+    PAGE_FREE_HEAD.store(next, Ordering::Relaxed);
+    PAGE_FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+
     unsafe {
-        next_ptr.write_volatile(next + PAGE_SIZE);
-        core::ptr::write_bytes(virtual_address as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(page, 0, PAGE_SIZE as usize);
     }
-    Some((next, virtual_address as *mut u8))
+    Some((physical, page))
+}
+
+unsafe fn free_page(physical: u64) -> bool {
+    if physical < 0x10_0000 || physical & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    let total = PAGE_TOTAL_COUNT.load(Ordering::Acquire);
+    while PAGE_ALLOCATOR_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        unsafe {
+            asm!("pause", options(nomem, nostack, preserves_flags));
+        }
+    }
+    let free_count = PAGE_FREE_COUNT.load(Ordering::Relaxed);
+    if free_count >= total {
+        PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+        return false;
+    }
+    let hhdm_offset = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(virtual_address) = physical.checked_add(hhdm_offset) else {
+        PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+        return false;
+    };
+    let page = virtual_address as *mut u64;
+    unsafe {
+        page.write_volatile(PAGE_FREE_HEAD.load(Ordering::Relaxed));
+    }
+    PAGE_FREE_HEAD.store(physical, Ordering::Relaxed);
+    PAGE_FREE_COUNT.store(free_count + 1, Ordering::Relaxed);
+    PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+    true
+}
+
+fn page_allocator_stats() -> (u64, u64, u64) {
+    while PAGE_ALLOCATOR_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        unsafe {
+            asm!("pause", options(nomem, nostack, preserves_flags));
+        }
+    }
+    let total = PAGE_TOTAL_COUNT.load(Ordering::Relaxed);
+    let available = PAGE_FREE_COUNT.load(Ordering::Relaxed).min(total);
+    let used = total.saturating_sub(available);
+    PAGE_ALLOCATOR_LOCK.store(0, Ordering::Release);
+    (
+        total.saturating_mul(PAGE_SIZE),
+        used.saturating_mul(PAGE_SIZE),
+        available.saturating_mul(PAGE_SIZE),
+    )
 }
 
 fn map_user_test_program() -> bool {
@@ -996,11 +1095,21 @@ fn map_user_test_program() -> bool {
 
 fn configure_syscall_entry() {
     unsafe {
-        let efer = read_msr(0xC000_0080) | 1;
+        let mut efer = read_msr(0xC000_0080) | 1;
+        if NX_ENABLED.load(Ordering::Acquire) != 0 {
+            efer |= 1 << 11;
+        }
         write_msr(0xC000_0080, efer);
         write_msr(0xC000_0081, (0x10_u64 << 48) | (0x08_u64 << 32));
         write_msr(0xC000_0082, syscall_entry as *const () as usize as u64);
         write_msr(0xC000_0084, 0x700);
+    }
+}
+
+fn cpu_supports_nx() -> bool {
+    unsafe {
+        let max_leaf = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+        max_leaf >= 0x8000_0001 && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 20) != 0
     }
 }
 
@@ -1039,7 +1148,7 @@ fn page_table_root() -> u64 {
     }
 }
 
-unsafe fn map_user_page(va: u64, phys: u64) -> bool {
+unsafe fn map_user_page(va: u64, phys: u64, segment_flags: u32) -> bool {
     let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
     let root = page_table_root();
     let Some(root_va) = root.checked_add(hhdm) else { return false; };
@@ -1052,9 +1161,14 @@ unsafe fn map_user_page(va: u64, phys: u64) -> bool {
     unsafe fn ensure_table(entry_ptr: *mut u64, hhdm: u64) -> Option<*mut u64> {
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & 1 != 0 {
-            unsafe { entry_ptr.write_volatile(entry | 0x7); }
+            if entry & (1 << 7) != 0 {
+                return None;
+            }
+            unsafe {
+                entry_ptr.write_volatile(entry | 0x7);
+            }
             let phys = entry & 0x000F_FFFF_FFFF_F000;
-            return Some((phys + hhdm) as *mut u64);
+            return Some(phys.checked_add(hhdm)? as *mut u64);
         }
         let (phys, virt) = unsafe { allocate_page()? };
         unsafe { entry_ptr.write_volatile(phys | 0x7); }
@@ -1067,8 +1181,17 @@ unsafe fn map_user_page(va: u64, phys: u64) -> bool {
     if unsafe { pt.add(idx1).read_volatile() } & 1 != 0 {
         return false;
     }
-    unsafe { pt.add(idx1).write_volatile((phys & 0x000F_FFFF_FFFF_F000) | 0x7); }
-    unsafe { asm!("invlpg [{}]", in(reg) va as usize, options(nostack, preserves_flags)); }
+    let page_flags = elf::user_page_flags(
+        segment_flags,
+        NX_ENABLED.load(Ordering::Acquire) != 0,
+    );
+    unsafe {
+        pt.add(idx1)
+            .write_volatile((phys & 0x000F_FFFF_FFFF_F000) | page_flags);
+    }
+    unsafe {
+        asm!("invlpg [{}]", in(reg) va as usize, options(nostack, preserves_flags));
+    }
     true
 }
 
@@ -1105,7 +1228,8 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
             let Some((physical, _)) = (unsafe { allocate_page() }) else {
                 return Err(syscall::ENOMEM);
             };
-            if !unsafe { map_user_page(page_address, physical) } {
+            if !unsafe { map_user_page(page_address, physical, segment.flags) } {
+                let _ = unsafe { free_page(physical) };
                 return Err(syscall::ENOMEM);
             }
 
@@ -1139,6 +1263,19 @@ fn load_user_elf(path: &[u8]) -> Result<u64, u64> {
             page_address += PAGE_SIZE;
         }
     }
+
+    let mut stack_address = USER_STACK_BASE;
+    while stack_address < USER_STACK_TOP {
+        let Some((physical, _)) = (unsafe { allocate_page() }) else {
+            return Err(syscall::ENOMEM);
+        };
+        if !unsafe { map_user_page(stack_address, physical, 2) } {
+            let _ = unsafe { free_page(physical) };
+            return Err(syscall::ENOMEM);
+        }
+        stack_address += PAGE_SIZE;
+    }
+
     Ok(plan.entry)
 }
 
@@ -1147,8 +1284,6 @@ fn try_exec_user_program(path: &[u8]) -> Result<u64, u64> {
     configure_syscall_entry();
     Ok(entry)
 }
-
-#[unsafe(no_mangle)]
 
 type SyscallResult = syscall::SyscallResult;
 
@@ -1590,11 +1725,22 @@ fn syscall_wait_event(event_id: u64, timeout_ms: u64) -> SyscallResult {
 }
 
 fn syscall_get_memory_info(ptr: u64) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(ptr, core::mem::size_of::<syscall::MemoryInfo>() as u64, true) { return syscall_error(e); }
-    let total = unsafe { ALLOCATOR_END.saturating_sub(ALLOCATOR_START) };
-    let used = unsafe { ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START) };
-    let info = syscall::MemoryInfo { managed_bytes: total, allocated_bytes: used, available_bytes: total.saturating_sub(used) };
-    unsafe { core::ptr::write(ptr as *mut syscall::MemoryInfo, info); }
+    if let Err(e) = validate_user_buffer(
+        ptr,
+        core::mem::size_of::<syscall::MemoryInfo>() as u64,
+        true,
+    ) {
+        return syscall_error(e);
+    }
+    let (total, used, available) = page_allocator_stats();
+    let info = syscall::MemoryInfo {
+        managed_bytes: total,
+        allocated_bytes: used,
+        available_bytes: available,
+    };
+    unsafe {
+        core::ptr::write(ptr as *mut syscall::MemoryInfo, info);
+    }
     SyscallResult::success(0)
 }
 
@@ -2578,15 +2724,15 @@ fn sc_mem_zero(arg0: u64, arg1: u64) -> syscall::SyscallResult {
 }
 
 fn sc_mem_available() -> syscall::SyscallResult {
-    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(total.saturating_sub(used)) }
+    syscall::SyscallResult::success(page_allocator_stats().2)
 }
 
 fn sc_mem_used() -> syscall::SyscallResult {
-    { let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(used) }
+    syscall::SyscallResult::success(page_allocator_stats().1)
 }
 
 fn sc_mem_total() -> syscall::SyscallResult {
-    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; syscall::SyscallResult::success(total) }
+    syscall::SyscallResult::success(page_allocator_stats().0)
 }
 
 fn sc_heap_alloc_app(arg0: u64) -> syscall::SyscallResult {
@@ -3026,7 +3172,22 @@ fn sc_kmem_protect(arg0: u64, arg1: u64, arg2: u64) -> syscall::SyscallResult {
 }
 
 fn sc_kmem_query(arg0: u64, arg1: u64) -> syscall::SyscallResult {
-    { let total=unsafe{ALLOCATOR_END.saturating_sub(ALLOCATOR_START)}; let used=unsafe{ALLOCATOR_NEXT.saturating_sub(ALLOCATOR_START)}; let info=syscall::MemoryInfo{managed_bytes:total,allocated_bytes:used,available_bytes:total.saturating_sub(used)}; let b=unsafe{core::slice::from_raw_parts((&info as *const syscall::MemoryInfo).cast::<u8>(),core::mem::size_of::<syscall::MemoryInfo>())}; match sc_copy_to_user(arg1,b.len() as u64,b){Ok(_)=>syscall::SyscallResult::success(0),Err(e)=>syscall_error(e)} }
+    let (managed_bytes, allocated_bytes, available_bytes) = page_allocator_stats();
+    let info = syscall::MemoryInfo {
+        managed_bytes,
+        allocated_bytes,
+        available_bytes,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const syscall::MemoryInfo).cast::<u8>(),
+            core::mem::size_of::<syscall::MemoryInfo>(),
+        )
+    };
+    match sc_copy_to_user(arg1, bytes.len() as u64, bytes) {
+        Ok(_) => syscall::SyscallResult::success(0),
+        Err(error) => syscall_error(error),
+    }
 }
 
 fn sc_kmem_stats(arg0: u64) -> syscall::SyscallResult {
@@ -5428,19 +5589,11 @@ fn get_system_info(kind: u64, buffer: u64, length: u64) -> syscall::SyscallResul
             size
         }
         syscall::SYSTEM_INFO_MEMORY => {
-            let start = unsafe { core::ptr::addr_of!(ALLOCATOR_START).read_volatile() };
-            let next = unsafe { core::ptr::addr_of!(ALLOCATOR_NEXT).read_volatile() };
-            let end = unsafe { core::ptr::addr_of!(ALLOCATOR_END).read_volatile() };
-            if start > next || next > end {
-                return syscall::SyscallResult {
-                    value: u64::MAX,
-                    error: syscall::EIO,
-                };
-            }
+            let (managed_bytes, allocated_bytes, available_bytes) = page_allocator_stats();
             let info = syscall::MemoryInfo {
-                managed_bytes: end - start,
-                allocated_bytes: next - start,
-                available_bytes: end - next,
+                managed_bytes,
+                allocated_bytes,
+                available_bytes,
             };
             let size = core::mem::size_of_val(&info);
             unsafe {
@@ -5648,7 +5801,59 @@ fn valid_user_range(address: u64, length: usize) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;
     };
-    address >= USER_CODE_BASE && end <= USER_REGION_END
+    let heap_end = USER_HEAP_NEXT.load(Ordering::Acquire);
+    if address < USER_CODE_BASE || address > heap_end || end > heap_end || end > USER_ADDRESS_LIMIT
+    {
+        return false;
+    }
+    if length == 0 {
+        return true;
+    }
+
+    let mut page_address = address & !(PAGE_SIZE - 1);
+    let last_page = (end - 1) & !(PAGE_SIZE - 1);
+    loop {
+        if !user_page_mapped(page_address) {
+            return false;
+        }
+        if page_address == last_page {
+            return true;
+        }
+        let Some(next) = page_address.checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        page_address = next;
+    }
+}
+
+fn user_page_mapped(address: u64) -> bool {
+    let hhdm = unsafe { core::ptr::addr_of!(HHDM_OFFSET).read_volatile() };
+    let Some(root_address) = page_table_root().checked_add(hhdm) else {
+        return false;
+    };
+    let pml4 = root_address as *const u64;
+    let indexes = [
+        ((address >> 39) & 0x1FF) as usize,
+        ((address >> 30) & 0x1FF) as usize,
+        ((address >> 21) & 0x1FF) as usize,
+        ((address >> 12) & 0x1FF) as usize,
+    ];
+    let mut table = pml4;
+    for (level, index) in indexes.into_iter().enumerate() {
+        let entry = unsafe { table.add(index).read_volatile() };
+        if entry & 0x5 != 0x5 || (level > 0 && entry & (1 << 7) != 0) {
+            return false;
+        }
+        if level == indexes.len() - 1 {
+            return true;
+        }
+        let physical = entry & 0x000F_FFFF_FFFF_F000;
+        let Some(virtual_address) = physical.checked_add(hhdm) else {
+            return false;
+        };
+        table = virtual_address as *const u64;
+    }
+    false
 }
 
 impl Console {

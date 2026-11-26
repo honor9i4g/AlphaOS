@@ -29,6 +29,19 @@ const PT_LOAD: u32 = 1;
 const PF_WRITE: u32 = 2;
 const PF_EXECUTE: u32 = 1;
 
+pub const fn user_page_flags(segment_flags: u32, nx_supported: bool) -> u64 {
+    let mut flags = 0x5
+        | if segment_flags & PF_WRITE != 0 {
+            0x2
+        } else {
+            0
+        };
+    if nx_supported && segment_flags & PF_EXECUTE == 0 {
+        flags |= 1 << 63;
+    }
+    flags
+}
+
 pub fn validate_image(
     image: &[u8],
     user_start: u64,
@@ -81,7 +94,7 @@ pub fn validate_image(
         }
         if segment.file_size > segment.memory_size
             || segment.flags & !7 != 0
-            || segment.flags & (PF_WRITE | PF_EXECUTE) == PF_WRITE | PF_EXECUTE
+            || segment.flags & (PF_WRITE | PF_EXECUTE) == (PF_WRITE | PF_EXECUTE)
         {
             return Err(ValidationError::InvalidImage);
         }
@@ -119,9 +132,7 @@ pub fn validate_image(
             return Err(ValidationError::OutOfRange);
         }
         has_load_segment = true;
-        if segment.flags & PF_EXECUTE != 0
-            && entry >= segment.virtual_address
-            && entry < memory_end
+        if segment.flags & PF_EXECUTE != 0 && entry >= segment.virtual_address && entry < memory_end
         {
             entry_is_executable = true;
         }
@@ -186,9 +197,7 @@ pub fn program_header(
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ValidationError> {
-    let end = offset
-        .checked_add(2)
-        .ok_or(ValidationError::InvalidImage)?;
+    let end = offset.checked_add(2).ok_or(ValidationError::InvalidImage)?;
     let data: [u8; 2] = bytes
         .get(offset..end)
         .ok_or(ValidationError::InvalidImage)?
@@ -198,9 +207,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ValidationError> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ValidationError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(ValidationError::InvalidImage)?;
+    let end = offset.checked_add(4).ok_or(ValidationError::InvalidImage)?;
     let data: [u8; 4] = bytes
         .get(offset..end)
         .ok_or(ValidationError::InvalidImage)?
@@ -210,9 +217,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ValidationError> {
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ValidationError> {
-    let end = offset
-        .checked_add(8)
-        .ok_or(ValidationError::InvalidImage)?;
+    let end = offset.checked_add(8).ok_or(ValidationError::InvalidImage)?;
     let data: [u8; 8] = bytes
         .get(offset..end)
         .ok_or(ValidationError::InvalidImage)?

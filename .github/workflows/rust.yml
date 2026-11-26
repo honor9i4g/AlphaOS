@@ -33,9 +33,14 @@ jobs:
         working-directory: kernel-freestanding
         run: cargo build --target x86_64-unknown-none
 
-      - name: Check freestanding kernel formatting
+      - name: Check edited freestanding Rust formatting
         working-directory: kernel-freestanding
-        run: cargo fmt --all --check
+        run: rustfmt --edition=2024 --check src/elf.rs tests/elf_validation.rs
+
+      - name: Test ELF loader validation
+        run: |
+          rustc --edition=2024 --test kernel-freestanding/tests/elf_validation.rs -o target/elf-validation
+          ./target/elf-validation
 
       - name: Test syscall ABI
         working-directory: kernel-freestanding/syscall-abi

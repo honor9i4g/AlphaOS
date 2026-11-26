@@ -18,6 +18,9 @@ without losing the existing QEMU-testable shell.
   persistent filesystem/storage drivers, richer device/input/graphics drivers,
   windowing/compositor/UI toolkit, IPC/services, packaging, and security
   hardening.
+- **Runtime status**: the freestanding build and host-side tests pass, but
+  QEMU has not yet confirmed execution of the Limine kernel entry point. Do
+  not treat the prototype as a boot-verified or stable OS.
 
 ## Freestanding syscall ABI
 
@@ -43,20 +46,36 @@ cargo test --manifest-path .\kernel-freestanding\syscall-abi\Cargo.toml --target
 
 The freestanding kernel prototype now includes initial M1 execution-path work:
 
-- **ELF64 loader**: loads `PT_LOAD` ELF64 executables from RAMFS into the user
-  region and validates basic executable/header constraints (`ENOEXEC` on invalid
-  images).
+- **ELF64 loader**: validates ELF headers and program-table bounds, segment file
+  and memory ranges, page alignment/overlap, executable entry-point membership,
+  and writable-executable segment policy before mapping `PT_LOAD` segments from
+  RAMFS. Segment write/execute permissions are reflected in page-table entries;
+  non-executable pages use NX when supported. A four-page user stack is mapped,
+  and syscall buffer checks require present user pages. Invalid images return
+  `ENOEXEC`; out-of-range segments return `EFAULT`.
+- **Physical frames**: builds a free-page list from Limine-reported usable
+  memory, zeroes frames on allocation, returns an unused frame if an ELF page
+  cannot be mapped, and reports total/allocated/available frame bytes. General
+  unmapping and process teardown still need to return their frames.
 - **Kernel resume/run loop**: runs user processes on a dedicated kernel resume
   stack; `sys_exit` resumes the kernel loop instead of halting.
-- **Spawn/exec/wait**: `sys_spawn` loads an ELF from RAMFS and queues a process;
-  `sys_exec`/`proc_exec` replace/requeue the current process image; `sys_wait`
-  reaps exited processes and reports exit status.
-- **Single-address-space limitation**: the current prototype does not yet provide
-  per-process page tables/isolation. Spawning from an active user process is
-  currently limited (`ENOTSUP`) to avoid clobbering the shared user address
-  space.
+- **Process syscall groundwork**: process table, ELF loading, and
+  spawn/exec/wait handlers exist, but there is no init process or userspace
+  launcher. Active-process spawn/exec and complete lifecycle/reclamation are
+  not yet a working isolated process model.
+- **Single-address-space limitation**: the current prototype still has no
+  per-process page tables/isolation or general user-page reclamation. Spawning
+  from an active user process is limited (`ENOTSUP`) to avoid clobbering shared
+  mappings. No init userspace process or bundled demo app is provided.
 
 No tiny userspace demo apps are included by default.
+
+Run the focused ELF validation tests from the repository root:
+
+```powershell
+rustc --edition=2024 --test .\kernel-freestanding\tests\elf_validation.rs -o .\kernel-freestanding\target\elf-validation.exe
+.\kernel-freestanding\target\elf-validation.exe
+```
 
 ## UEFI shell/kernel features
 
